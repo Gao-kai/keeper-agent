@@ -1,0 +1,56 @@
+# Compiled Python files
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.so
+
+# Virtual environment
+venv/
+.env/
+env/
+ENV/
+*.egg-info/
+.pip/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Documentation
+docs/_build/
+
+# Build artifacts
+dist/
+build/
+*.egg
+
+# Jupyter notebooks
+*.ipynb_checkpoints
+
+# Environment variables
+.env
+.local.env
+
+# Database
+*.db
+*.sqlite
+/volumes
+/docs
