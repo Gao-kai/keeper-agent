@@ -2,8 +2,8 @@
 入口节点模块
 
 # 功能
-    1. 文件类型检测与路由
-    2. 将PDF文档转化为MarkDown格式
+    1. 文件类型检测
+    2. 路由导航
 
 # 实现
     1. 文件类型检测与条件路由
@@ -17,7 +17,7 @@ import json
 from knowledge.processor.import_process.base import BaseNode, T
 from knowledge.processor.import_process.exception import ValidationError
 from pathlib import Path
-from knowledge.processor.import_process.logging import setup_logging
+from knowledge.processor.import_process.log_config import setup_logging
 
 
 class EntryNode(BaseNode):
@@ -28,7 +28,7 @@ class EntryNode(BaseNode):
     PDF文件 走PDF处理节点
     MC文件  走MD处理节点
     """
-    name = "entry"
+    name = "entry_node"
 
     def process(self, state: T) -> T:
         """

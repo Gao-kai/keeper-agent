@@ -54,3 +54,6 @@ build/
 *.sqlite
 /volumes
 /docs
+
+data/**/*
+output/**/*

@@ -18,7 +18,10 @@
 import copy
 from typing import TypedDict, List, Dict
 
-
+"""
+TypedDict: TypedDict 允许为每个键指定明确类型,提供静态检查
+total=False: 表示字典中所有字段都为可选字段
+"""
 class ImportGraphState(TypedDict, total=False):
     # ==================== 任务标识 ====================
     task_id: str  # 任务 ID，用于任务追踪
