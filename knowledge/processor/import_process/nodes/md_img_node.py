@@ -8,6 +8,8 @@ MD中图片链接处理
 
 # 对象存储的优点
 ak sk entry_point
+
+# TODO 并行处理图片摘要 + 大图片本地压缩
 """
 import base64
 import os
@@ -17,13 +19,16 @@ import time
 from collections import deque
 from pathlib import Path
 from pyexpat.errors import messages
-from typing import Tuple, List, Deque
+from typing import Tuple, List, Deque, Dict
+from minio import Minio
+
 
 from knowledge.processor.import_process.base import BaseNode, T
 from knowledge.processor.import_process.config import get_import_config, ImportConfig
 from knowledge.processor.import_process.exception import ValidationError, FileProcessingError
 from knowledge.processor.import_process.log_config import setup_logging
 from knowledge.processor.import_process.state import ImportGraphState
+from knowledge.utils.minio_client import get_minio_client
 
 
 class MDImageNode(BaseNode):
@@ -47,21 +52,44 @@ class MDImageNode(BaseNode):
 			state["md_content"] = md_content
 			return state
 		
-		# 2. 扫描并处理图片
+		# 2. 扫描并处理图片(减少VLM大模型噪音)
 		target_images_list = self._scan_and_filter_images(md_content, md_path_obj, images_dir_obj)
 		if not target_images_list:
 			self.logger.info(f"文件{md_path_obj.name}中未找到需要处理的有效图片引用")
 			return state
 		
 		# 3. VLM模型生成图片描述
-		images_summarise = self._generate_image_summaries(md_path_obj, target_images_list)
-		print(images_summarise)
+		# images_summarise = self._generate_image_summaries(md_path_obj, target_images_list)
+		# print(images_summarise)
+		images_summarise = {
+		    '820246ff8d6f448489eb36a1297e028a8ca8ff17100aecb8aa38d685b069fc19.jpg': '直流电流测量接线示意图',
+		    'eb330b9b1b79716fc9feacd30808b4ed86c395ebaab24c29dec65d68060e10be.jpg': '直流电流测量接线示意图',
+		    '3dce15efe5689c2d8c904dfbbb653eef71ce00b270bd08d47e3b474af2fb68a8.jpg': '万用表电阻测量',
+		    '87ccf38edca64aa36a803d7091a6385340dace221ee3105f93037e3b4285d161.jpg': '最大电压限制标识',
+		    '84c37b209829d15820d5bbe76bbc98e1bf9eddc58bd9c983fc710cb2747d341b.jpg': '交流电压测量示意图',
+		    'f5c6db12e9569ee13bd78fd38747397dd535fbb72326e87b43deaa240e8ec70b.jpg': '双绝缘保护标识',
+		    'a6c9fcfb41cfc997c0f88e35c06f34818e7b53d83d92fa3580257172c1c24ec7.jpg': 'RSPro品牌标志',
+		    '2ec4f0e7e8b05c73503dc25db1ad0e65b99a06b2dea8d8a9525a1865c75095e0.jpg': '警告标识',
+		    '9cc6ec399a5591e7939d410fc4f8c64396dd6935ac92a4830442fd8a69ff71de.jpg': '危险电压标识',
+		    'f5470dcb3ab08b06212db41f4b4b4728bcd0d46a0bafcae45dbee4b840a4ec65.jpg': '二极管测试指示符号',
+		    '16f1ae918c8905b9e4fc1d0c08fe8a9b55c34d69f4c1191f790bf08571419299.jpg': '中文语言标识',
+		    'd6946861c4592804bd8d7e75b58029565712d4dc58f855e374bf0fcf370c91dd.jpg': '万用表RS-12外观及端口示意图',
+		    '17a896b47789994e2944e1590940a56fff9a93c68fed9b924cd572f4917cf087.jpg': 'RS-12数字万用表外观图'
+		}
+
 		
-		# 5. 将图片描述替换到MD文档中
+		# 5. 将图片上传至Minio服务器
+		minio_client = get_minio_client()
+		remote_image_urls = self._upload_images_to_minio(target_images_list, minio_client, md_path_obj,config=get_import_config())
 		
-		# 4. 上传至Minio服务器
-		
-		# 5. 回写图片摘要和图片链接到md_content
+		# 6.  回写图片摘要和图片链接到md_content
+		new_md_content = self._replace_summary_and_remote_url(remote_image_urls,images_summarise,md_path_obj,md_content)
+		with open(md_path_obj.with_name(f"{md_path_obj.stem}_new{md_path_obj.suffix}"),'w',encoding='utf-8') as f:
+			f.write(new_md_content)
+		self.logger.info(f'MD文档替换完成')
+
+		# 7. 更新state
+		state['md_content'] = new_md_content
 		return state
 	
 	def _get_md_info(self, state: ImportGraphState) -> Tuple[str, Path, Path]:
@@ -293,7 +321,7 @@ class MDImageNode(BaseNode):
 		
 		request_timestamps: Deque[float] = deque()
 		window_seconds = 60
-		max_request = 10
+		max_request = config.requests_per_minute or 10
 		for item_image in target_images_list:
 			image_name, image_path, primary_image_context = item_image
 			
@@ -380,7 +408,7 @@ class MDImageNode(BaseNode):
 	
 	def _image_to_base64_data_url(self, image_path: str):
 		# 读取文件的MIME类型
-		mime_type,_ = mimetypes.guess_type(image_path)
+		mime_type, _ = mimetypes.guess_type(image_path)
 		if not mime_type:
 			return "图片格式MIME不正确"
 		
@@ -407,23 +435,76 @@ class MDImageNode(BaseNode):
 		current_time = time.time()
 		
 		# 每次请求发起前先判断窗口中是否有已经超出时间窗口大小请求（清理🧹）
-		if request_timestamps and current_time - request_timestamps[0] >= window_seconds:
+		while request_timestamps and current_time - request_timestamps[0] >= window_seconds:
 			request_timestamps.popleft()
 		
 		# 每次请求发起前判断是否超出当前时间窗口的最大请求数量
 		if len(request_timestamps) >= max_request:
-			sleep_duration = window_seconds - request_timestamps[0]
+			sleep_duration = window_seconds - (current_time - request_timestamps[0])
 			if sleep_duration >= 0:
 				self.logger.info(f"当前时间窗口{window_seconds}内已达到最大API请求数量，暂停等待{sleep_duration:.2f}秒")
 				time.sleep(sleep_duration)
 			
 			# 休眠完成之后再次清理超出时间窗口的请求
 			current_time = time.time()
-			if request_timestamps and current_time - request_timestamps[0] >= window_seconds:
+			while request_timestamps and current_time - request_timestamps[0] >= window_seconds:
 				request_timestamps.popleft()
 		
 		# 既未超出时间窗口 也未超出最大请求数量 直接入队列 视为一次请求
 		request_timestamps.append(current_time)
+	
+	def _upload_images_to_minio(self, target_images_list, minio_client: Minio, md_path_obj: Path, config: ImportConfig):
+		"""
+		上传文件到Minio服务器
+		Args:
+			target_images_list: 目标图片
+			minio_client: Minio客户端
+			md_path_obj: Path对象
+		Returns:
+			remote_image_urls: Dict[图片名称，远程地址]
+		"""
+		remote_image_urls: Dict[str, str] = {}
+		if not minio_client:
+			self.logger.warn(f"Minio客户端未创建，无法上传本地文件至Minio服务器")
+		
+		for image_item in target_images_list:
+			image_name, image_path, _ = image_item
+			object_name = f"{md_path_obj.stem}/{image_name}"
+			try:
+				minio_client.fput_object(
+					bucket_name=config.minio_bucket,
+					object_name=object_name,
+					file_path=image_path
+				)
+				remote_url = f"{config.get_minio_base_url()}/{object_name}"
+				self.logger.info(f"图片上传成功: {image_name}")
+				remote_image_urls[image_name] = remote_url
+			except Exception as e:
+				self.logger.error(f"图片上传失败: {image_name}:{e}")
+				remote_image_urls[image_name] = ''
+		
+		return remote_image_urls
+	
+	def _replace_summary_and_remote_url(self, remote_image_urls, images_summarise,md_path_obj:Path,md_content:str):
+		"""
+		替换旧MD文档中图片的摘要和远程地址
+		Args:
+			remote_image_urls:
+			images_summarise:
+
+		Returns:
+
+		"""
+		new_md_content = md_content
+		for image_name,image_summary in images_summarise.items():
+			remote_url = remote_image_urls.get(image_name,"")
+			if not remote_url:
+				continue
+				
+			image_in_markdown_pattern = re.compile(r"!\[.*?]\(.*?" + re.escape(image_name) + r".*?\)",re.IGNORECASE)
+			new_md_content = image_in_markdown_pattern.sub(f"![{image_summary}]({remote_url})",new_md_content)
+		self.logger.info(f"成功替换{len(remote_image_urls)}张图片链接")
+		return new_md_content
 
 
 if __name__ == "__main__":
