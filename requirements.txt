@@ -17,3 +17,4 @@ neo4j                    # Neo4j 图数据库驱动
 pymongo                  # MongoDB 驱动
 mineru[all]              # PDF 解析工具
 openai-agents            # OpenAI Agent 框架
+python-dotenv

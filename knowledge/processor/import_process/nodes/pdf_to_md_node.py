@@ -37,6 +37,7 @@ import subprocess
 import time
 import json
 from pathlib import Path
+from typing import Tuple
 
 from knowledge.processor.import_process.base import BaseNode, T
 from knowledge.processor.import_process.exception import FileProcessingError, PdfConversionError
@@ -80,7 +81,7 @@ class PDFToMarkDownNode(BaseNode):
         state['md_path'] = self._get_md_path(pdf_path_obj,output_dir_obj)
         return state
 
-    def _validate_import_file_paths(self, state: ImportGraphState) -> tuple:
+    def _validate_import_file_paths(self, state: ImportGraphState) -> Tuple[Path,Path]:
         """
         验证 PDF路径和输出目录
         Args:
@@ -192,7 +193,7 @@ class PDFToMarkDownNode(BaseNode):
 if __name__ == "__main__":
     setup_logging()
     pdf_to_md_node = PDFToMarkDownNode()
-    import_file_path = "/Users/artest/Desktop/shopkeeper/data/doc/H3C LA2608室内无线网关 用户手册-6W100-整本手册.pdf"
+    import_file_path = "/Users/artest/Desktop/shopkeeper/data/doc/万用表RS-12的使用.pdf"
     process_state = pdf_to_md_node({
         "pdf_path": import_file_path,
         "file_dir": "/Users/artest/Desktop/shopkeeper/output"
