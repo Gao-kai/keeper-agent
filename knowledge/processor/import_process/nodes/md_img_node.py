@@ -22,7 +22,6 @@ from pyexpat.errors import messages
 from typing import Tuple, List, Deque, Dict
 from minio import Minio
 
-
 from knowledge.processor.import_process.base import BaseNode, T
 from knowledge.processor.import_process.config import get_import_config, ImportConfig
 from knowledge.processor.import_process.exception import ValidationError, FileProcessingError
@@ -59,35 +58,36 @@ class MDImageNode(BaseNode):
 			return state
 		
 		# 3. VLM模型生成图片描述
-		# images_summarise = self._generate_image_summaries(md_path_obj, target_images_list)
-		# print(images_summarise)
-		images_summarise = {
-		    '820246ff8d6f448489eb36a1297e028a8ca8ff17100aecb8aa38d685b069fc19.jpg': '直流电流测量接线示意图',
-		    'eb330b9b1b79716fc9feacd30808b4ed86c395ebaab24c29dec65d68060e10be.jpg': '直流电流测量接线示意图',
-		    '3dce15efe5689c2d8c904dfbbb653eef71ce00b270bd08d47e3b474af2fb68a8.jpg': '万用表电阻测量',
-		    '87ccf38edca64aa36a803d7091a6385340dace221ee3105f93037e3b4285d161.jpg': '最大电压限制标识',
-		    '84c37b209829d15820d5bbe76bbc98e1bf9eddc58bd9c983fc710cb2747d341b.jpg': '交流电压测量示意图',
-		    'f5c6db12e9569ee13bd78fd38747397dd535fbb72326e87b43deaa240e8ec70b.jpg': '双绝缘保护标识',
-		    'a6c9fcfb41cfc997c0f88e35c06f34818e7b53d83d92fa3580257172c1c24ec7.jpg': 'RSPro品牌标志',
-		    '2ec4f0e7e8b05c73503dc25db1ad0e65b99a06b2dea8d8a9525a1865c75095e0.jpg': '警告标识',
-		    '9cc6ec399a5591e7939d410fc4f8c64396dd6935ac92a4830442fd8a69ff71de.jpg': '危险电压标识',
-		    'f5470dcb3ab08b06212db41f4b4b4728bcd0d46a0bafcae45dbee4b840a4ec65.jpg': '二极管测试指示符号',
-		    '16f1ae918c8905b9e4fc1d0c08fe8a9b55c34d69f4c1191f790bf08571419299.jpg': '中文语言标识',
-		    'd6946861c4592804bd8d7e75b58029565712d4dc58f855e374bf0fcf370c91dd.jpg': '万用表RS-12外观及端口示意图',
-		    '17a896b47789994e2944e1590940a56fff9a93c68fed9b924cd572f4917cf087.jpg': 'RS-12数字万用表外观图'
-		}
-
+		images_summarise = self._generate_image_summaries(md_path_obj, target_images_list)
+		print(images_summarise)
+		# images_summarise = {
+		#     '820246ff8d6f448489eb36a1297e028a8ca8ff17100aecb8aa38d685b069fc19.jpg': '直流电流测量接线示意图',
+		#     'eb330b9b1b79716fc9feacd30808b4ed86c395ebaab24c29dec65d68060e10be.jpg': '直流电流测量接线示意图',
+		#     '3dce15efe5689c2d8c904dfbbb653eef71ce00b270bd08d47e3b474af2fb68a8.jpg': '万用表电阻测量',
+		#     '87ccf38edca64aa36a803d7091a6385340dace221ee3105f93037e3b4285d161.jpg': '最大电压限制标识',
+		#     '84c37b209829d15820d5bbe76bbc98e1bf9eddc58bd9c983fc710cb2747d341b.jpg': '交流电压测量示意图',
+		#     'f5c6db12e9569ee13bd78fd38747397dd535fbb72326e87b43deaa240e8ec70b.jpg': '双绝缘保护标识',
+		#     'a6c9fcfb41cfc997c0f88e35c06f34818e7b53d83d92fa3580257172c1c24ec7.jpg': 'RSPro品牌标志',
+		#     '2ec4f0e7e8b05c73503dc25db1ad0e65b99a06b2dea8d8a9525a1865c75095e0.jpg': '警告标识',
+		#     '9cc6ec399a5591e7939d410fc4f8c64396dd6935ac92a4830442fd8a69ff71de.jpg': '危险电压标识',
+		#     'f5470dcb3ab08b06212db41f4b4b4728bcd0d46a0bafcae45dbee4b840a4ec65.jpg': '二极管测试指示符号',
+		#     '16f1ae918c8905b9e4fc1d0c08fe8a9b55c34d69f4c1191f790bf08571419299.jpg': '中文语言标识',
+		#     'd6946861c4592804bd8d7e75b58029565712d4dc58f855e374bf0fcf370c91dd.jpg': '万用表RS-12外观及端口示意图',
+		#     '17a896b47789994e2944e1590940a56fff9a93c68fed9b924cd572f4917cf087.jpg': 'RS-12数字万用表外观图'
+		# }
 		
 		# 5. 将图片上传至Minio服务器
 		minio_client = get_minio_client()
-		remote_image_urls = self._upload_images_to_minio(target_images_list, minio_client, md_path_obj,config=get_import_config())
+		remote_image_urls = self._upload_images_to_minio(target_images_list, minio_client, md_path_obj,
+		                                                 config=get_import_config())
 		
 		# 6.  回写图片摘要和图片链接到md_content
-		new_md_content = self._replace_summary_and_remote_url(remote_image_urls,images_summarise,md_path_obj,md_content)
-		with open(md_path_obj.with_name(f"{md_path_obj.stem}_new{md_path_obj.suffix}"),'w',encoding='utf-8') as f:
+		new_md_content = self._replace_summary_and_remote_url(remote_image_urls, images_summarise, md_path_obj,
+		                                                      md_content)
+		with open(md_path_obj.with_name(f"{md_path_obj.stem}_new{md_path_obj.suffix}"), 'w', encoding='utf-8') as f:
 			f.write(new_md_content)
 		self.logger.info(f'MD文档替换完成')
-
+		
 		# 7. 更新state
 		state['md_content'] = new_md_content
 		return state
@@ -469,7 +469,7 @@ class MDImageNode(BaseNode):
 		
 		for image_item in target_images_list:
 			image_name, image_path, _ = image_item
-			object_name = f"{md_path_obj.stem}/{image_name}"
+			object_name = f"{md_path_obj.stem}/{image_name}".replace(" ","_")
 			try:
 				minio_client.fput_object(
 					bucket_name=config.minio_bucket,
@@ -485,7 +485,7 @@ class MDImageNode(BaseNode):
 		
 		return remote_image_urls
 	
-	def _replace_summary_and_remote_url(self, remote_image_urls, images_summarise,md_path_obj:Path,md_content:str):
+	def _replace_summary_and_remote_url(self, remote_image_urls, images_summarise, md_path_obj: Path, md_content: str):
 		"""
 		替换旧MD文档中图片的摘要和远程地址
 		Args:
@@ -496,13 +496,13 @@ class MDImageNode(BaseNode):
 
 		"""
 		new_md_content = md_content
-		for image_name,image_summary in images_summarise.items():
-			remote_url = remote_image_urls.get(image_name,"")
+		for image_name, image_summary in images_summarise.items():
+			remote_url = remote_image_urls.get(image_name, "")
 			if not remote_url:
 				continue
-				
-			image_in_markdown_pattern = re.compile(r"!\[.*?]\(.*?" + re.escape(image_name) + r".*?\)",re.IGNORECASE)
-			new_md_content = image_in_markdown_pattern.sub(f"![{image_summary}]({remote_url})",new_md_content)
+			
+			image_in_markdown_pattern = re.compile(r"!\[.*?]\(.*?" + re.escape(image_name) + r".*?\)", re.IGNORECASE)
+			new_md_content = image_in_markdown_pattern.sub(f"![{image_summary}]({remote_url})", new_md_content)
 		self.logger.info(f"成功替换{len(remote_image_urls)}张图片链接")
 		return new_md_content
 

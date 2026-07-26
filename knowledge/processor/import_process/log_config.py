@@ -27,8 +27,12 @@ def setup_logging(level: int = logging.INFO):
         >>> setup_logging()  # 使用默认的 INFO 级别
         >>> setup_logging(logging.DEBUG)  # 开启 DEBUG 级别日志
     """
+
+    
     logging.basicConfig(
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        datefmt='%Y-%m-%d %H:%M:%S',
+        force=True,
+        handlers=[logging.StreamHandler()] # 输出到控制台
     )

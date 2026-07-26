@@ -1,11 +1,25 @@
 import json
+from typing import Literal
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.state import CompiledStateGraph
 
+from knowledge.processor.import_process.log_config import setup_logging
 from knowledge.processor.import_process.nodes.entry_node import EntryNode
+from knowledge.processor.import_process.nodes.md_img_node import MDImageNode
 from knowledge.processor.import_process.nodes.pdf_to_md_node import PDFToMarkDownNode
 from knowledge.processor.import_process.state import ImportGraphState, create_default_state
+
+def route_condition(state: ImportGraphState) -> Literal["pdf", "md"]:
+    """
+    路由条件函数，根据文件类型判断是否需要处理为md文档
+    """
+    if state.get("is_pdf_read_enabled"):
+        return "pdf"
+    elif state.get("is_md_read_enabled"):
+        return "md"
+    else:
+        raise ValueError(f"不支持的文件类型: {state.get("import_file_path")}")
 
 
 def create_import_graph() -> CompiledStateGraph:
@@ -22,7 +36,8 @@ def create_import_graph() -> CompiledStateGraph:
     # 2. 定义图节点
     nodes = {
         "entry_node": EntryNode(),
-        "pdf_to_md_node": PDFToMarkDownNode()
+        "pdf_to_md_node": PDFToMarkDownNode(),
+        "md_image_node": MDImageNode()
     }
 
     # 3. 添加图节点
@@ -31,17 +46,27 @@ def create_import_graph() -> CompiledStateGraph:
 
     # 4. 定义边
     graph_buildr.add_edge(START, "entry_node")
-    graph_buildr.add_edge("entry_node", "pdf_to_md_node")
-    graph_buildr.add_edge("pdf_to_md_node", END)
+    graph_buildr.add_conditional_edges(
+        "entry_node",
+        route_condition,
+        {
+            "pdf": "pdf_to_md_node", # 首先处理为md文档 再去处理md文档中image节点
+            "md": "md_image_node" # 直接处理md文档中image节点
+        }
+    )
+    graph_buildr.add_edge("pdf_to_md_node", "md_image_node")
+    graph_buildr.add_edge("md_image_node", END)
 
     # 编译
     return graph_buildr.compile()
 
 
 if __name__ == "__main__":
-    import_graph = create_import_graph()
-
+    # 日志配置
+    setup_logging()
+    
     # 获取图的示意图
+    import_graph = create_import_graph()
     print(f"流程图示意图\n")
     import_graph.get_graph().print_ascii()
 
