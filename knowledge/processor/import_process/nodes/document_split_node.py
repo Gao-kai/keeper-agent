@@ -14,16 +14,17 @@
 import json
 import re
 from pathlib import Path
-from typing import List, Dict
-
+from typing import List, Dict, Any
 from knowledge.processor.import_process.base import BaseNode, T
 from knowledge.processor.import_process.config import get_import_config
+from knowledge.processor.import_process.exception import ConfigurationError
 from knowledge.processor.import_process.log_config import setup_logging
 from knowledge.processor.import_process.state import ImportGraphState
-
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 class DocumentSplitNode(BaseNode):
 	name = "document_split_node"
+	
 	def process(self, state: T) -> T:
 		"""
 		文档切分节点
@@ -38,21 +39,27 @@ class DocumentSplitNode(BaseNode):
 
 		Returns:
 			state: 图状态
-		
-		1. 先内容 后标题 都是文件名
-		2. 一上来就是标题
 		"""
 		
 		# 1. 从图状态中读取md_content
 		config = get_import_config()
-		md_content, file_title, max_content_length, md_file_name = self.get_node_info(state, config)
+		md_content, md_file_name, file_title, max_content_length, min_content_length = self.get_node_info(state, config)
 		
-		# 1. 根据MD标题切分
-		result = self.splitMarkDownByHeader(md_content, md_file_name)
-		print(json.dumps(result, ensure_ascii=False, indent=4))
+		# 2. 根据MD标题切分
+		section_list, has_title = self.splitMarkDownByHeader(md_content, md_file_name)
+		print(json.dumps(section_list, ensure_ascii=False, indent=4))
+		
+		# 3. 处理全文无标题的情况
+		
+		# 4. 对于过大或者过小的section进行二次切分或者合并
+		section_list = self.split_and_merge_section(section_list,max_content_length,min_content_length)
 	
 	# 2. section块太长 基于langchain实现二次切分
+	# 先切分 然后遍历 看比chunk size是大还是小 大的话继续切 小的话直接加入数组
+	# 全部切完之后进行merge操作 尝试依次将每一个块进行累加 如果小于chunk size继续加 大于则处理重叠然后加到下一个块里面
 	# 2. section块太短 尽可能合并同源信息
+	# 每一个都小 所有加起来都小
+	# 调试langchian源码
 	
 	# 3. 组装提交给Embedding模型的文本
 	
@@ -63,13 +70,17 @@ class DocumentSplitNode(BaseNode):
 		if md_content:
 			md_content = md_content.replace('\r\n', '\n').replace('\r', '\n')
 		file_title = state.get("file_title", "")
-		max_content_length = config.max_content_length
 		md_path_obj = Path(state.get("md_path", ""))
 		md_file_name = md_path_obj.stem
+		max_content_length = config.max_content_length
+		min_content_length = config.min_content_length
 		
-		return md_content, file_title, max_content_length, md_file_name
+		if max_content_length <= min_content_length:
+			raise ConfigurationError(node_name=self.name, message="文档块最大长度不能小于最小长度")
+		
+		return md_content, md_file_name, file_title, max_content_length, min_content_length
 	
-	def splitMarkDownByHeader(self, md_content, md_file_name:str):
+	def splitMarkDownByHeader(self, md_content, md_file_name: str):
 		"""
 		基于正则匹配Header后按照H1-H6切分
 		Args:
@@ -176,6 +187,102 @@ class DocumentSplitNode(BaseNode):
 		savePrevHeadingSection()
 		
 		return section_list, has_title
+	
+	def split_and_merge_section(self, section_list, max_content_length, min_content_length):
+		"""
+		二次切分场景
+		1. 文档块过大，防止语义被稀释
+		2. 需要自定义元数组
+		
+		二次合并场景：
+		1. 多个同源标题下小块可以合并
+		2. 代词在上下文中连续出现，合并有利于精确定位代词
+		3. 合并块不能超出模型的边界阈值
+		4. 元数组和跨权限的数据不能合并
+		Args:
+			section_list:
+			max_content_length:
+			min_content_length:
+
+		Returns:
+
+		"""
+		self.log_step(step_name="STEP-3", message="二次切分和合并块")
+		
+		current_sections = []
+		
+		# 1. 切分
+		for section in section_list:
+			current_sections.extend(self.split_long_section(section,max_content_length))
+		print(current_sections)
+		# 2. 合并
+		# final_sections = self.merge_short_sections(current_sections,min_content_length)
+		
+		# return final_sections
+	
+	def split_long_section(self, section, max_content_length)->List[Dict[str,Any]]:
+		"""
+		切分长的section
+		Args:
+			section:
+			max_content_length:
+
+		Returns:
+
+		"""
+		self.log_step(step_name="STEP-4",message=f"切分section{section.get("title","")}")
+		
+		section_title = section.get("title","")
+		section_body = section.get("body","")
+		section_parent_title = section.get("parent_title", "")
+		section_file_title = section.get("file_title", "")
+		
+		# 获取Title加上Body的总长度 小于最大长度 直接返回不进行二次切分
+		section_title = f"{section_title}\n\n"
+		total_length = len(section_body) + len(section_title) # 2800个字符
+		if total_length <= max_content_length:
+			return [section]
+		
+		# 二次切分 先计算最大可用chunk块的长度
+		available_chunk_size = max_content_length - len(section_title)
+		
+		# Edge Case：如果section标题长度大于最大长度 这种块直接返回 因为我们处理的是body 不是title
+		if available_chunk_size <= 0:
+			return  [section]
+		
+		# 基于langchain的text--spliter进行切分
+
+		text_spliter = RecursiveCharacterTextSplitter(
+			chunk_size=available_chunk_size,
+			chunk_overlap=0,
+			length_function=len,
+			separators=["\n\n", "\n", " ", "。","!","?","，",",",".",""],
+			keep_separator=False
+		)
+		
+		
+		chunks:List[str] = text_spliter.split_text(section_body)
+		# 如果二次切分出来还是一整块 那么无需再次处理 直接返回原section
+		# TODO：Langchain split_text源码 每一段都小于chunk_size 加起来也小于chunk_size
+		if len(chunks) <= 1:
+			return [section]
+		
+		# 如果二次切分后多块 那么二次构建section
+		sub_sections = []
+		for index,chunk in enumerate(chunks):
+			sub_sections.append({
+				"title": f"{section_title}-{index+1}",
+				"body": chunk,
+				"parent_title": section_parent_title,
+				"file_title": section_file_title,
+				"part": f"{index+1}"
+			})
+		
+		
+		return sub_sections
+	
+	def merge_short_sections(self, current_sections, min_content_length):
+		return []
 
 
 if __name__ == "__main__":
@@ -185,5 +292,6 @@ if __name__ == "__main__":
 		content = file.read()
 	node.process({
 		"file_title": "test.md",
-		"md_content": content
+		"md_content": content,
+		"md_path": "/Users/artest/Desktop/shopkeeper/knowledge/test/test.md"
 	})
