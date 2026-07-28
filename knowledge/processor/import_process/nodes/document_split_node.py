@@ -49,7 +49,7 @@ class DocumentSplitNode(BaseNode):
 		section_list, has_title = self.splitMarkDownByHeader(md_content, md_file_name)
 		print(json.dumps(section_list, ensure_ascii=False, indent=4))
 		
-		# 3. 处理全文无标题的情况
+		# 3. 处理全文无任意H1-H6标题的情况
 		
 		# 4. 对于过大或者过小的section进行二次切分或者合并
 		section_list = self.split_and_merge_section(section_list,max_content_length,min_content_length)
@@ -216,7 +216,7 @@ class DocumentSplitNode(BaseNode):
 			current_sections.extend(self.split_long_section(section,max_content_length))
 		print(current_sections)
 		# 2. 合并
-		# final_sections = self.merge_short_sections(current_sections,min_content_length)
+		final_sections = self.merge_short_sections(current_sections,min_content_length)
 		
 		# return final_sections
 	
@@ -282,6 +282,15 @@ class DocumentSplitNode(BaseNode):
 		return sub_sections
 	
 	def merge_short_sections(self, current_sections, min_content_length):
+		"""
+		
+		Args:
+			current_sections:
+			min_content_length:
+
+		Returns:
+
+		"""
 		return []
 
 
