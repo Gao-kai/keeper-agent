@@ -12,6 +12,7 @@
 
 """
 import json
+import os
 import re
 from pathlib import Path
 from typing import List, Dict, Any
@@ -22,11 +23,13 @@ from knowledge.processor.import_process.log_config import setup_logging
 from knowledge.processor.import_process.state import ImportGraphState
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from knowledge.utils.markdown_utils import MarkdownTableLinearizer
+
 
 class DocumentSplitNode(BaseNode):
 	name = "document_split_node"
 	
-	def process(self, state: T) -> T:
+	def process(self, state: ImportGraphState) -> ImportGraphState:
 		"""
 		文档切分节点
 		
@@ -50,19 +53,45 @@ class DocumentSplitNode(BaseNode):
 		# 2. 先根据MD标题H1-H6切分为若干个Section
 		section_list, has_title = self.splitMarkDownByHeader(md_content, md_file_name)
 		
-		
 		# 3. 处理全文无任意一个H1-H6标题的情况
 		if not has_title:
-			section_list = [{"title": "无标题", "body": md_content, "file_title": file_title,"parent_title":file_title}]
+			section_list = [
+				{"title": "无标题", "body": md_content, "file_title": file_title, "parent_title": file_title}]
 			self.logger.info("全文无标题，作为单个 chunk 处理")
 		
 		# 4. 对于过大或者过小的section进行二次切分或者合并
 		section_list = self.split_and_merge_section(section_list, max_content_length, min_content_length)
 		print(json.dumps(section_list, ensure_ascii=False, indent=4))
-		
+	
 		# 5. 组装提交给Embedding模型的文本
+		chunks = self.assemble_chunks(section_list)
 		
-		# 4. 更新状态state
+		# 6. 更新状态state
+		state["chunks"] = chunks
+		self.log_step(step_name="STEP-7",message="文档切分完成，更新state的chunks属性成功")
+		
+		# 7. 备份数据
+		self.backup_chunks(state,chunks)
+		return state
+	
+	def backup_chunks(self,state:ImportGraphState,chunks:List[Dict[str,Any]]):
+		output_file_dir = state.get("file_dir","")
+		md_path = state.get("md_path","")
+		
+		if not output_file_dir:
+			self.logger.debug("未设置文件输出目录")
+			md_path_obj = Path(md_path)
+			output_file_dir = md_path_obj.parent
+		
+		try:
+			os.makedirs(output_file_dir,exist_ok=True)
+			output_json_path = os.path.join(output_file_dir,"./chunks.json")
+			with open(output_json_path,"w",encoding="utf-8") as f:
+				json.dump(chunks,f,ensure_ascii=False,indent=4)
+				self.log_step(step_name="STEP-7",message=f"文档切分完成，备份切分结果至{output_file_dir}")
+		except Exception as e:
+				self.logger.warning(f"文件备份失败: {e}")
+		
 	def get_node_info(self, state: ImportGraphState, config):
 		self.log_step(step_name="STEP-1", message="获取节点信息")
 		md_content = state.get("md_content", "")
@@ -125,7 +154,7 @@ class DocumentSplitNode(BaseNode):
 				# 一级标题 or 一上来就是文本 此时父标题为空 默认设为文档标题
 				if not parent_title:
 					parent_title = md_file_name
-			
+				
 				section_list.append({
 					"title": current_title or md_file_name,
 					"body": prev_body_text,
@@ -220,12 +249,18 @@ class DocumentSplitNode(BaseNode):
 		
 		# 1. 切分大块
 		for section in section_list:
+			section_body = section.get("body","")
+			# 先处理表格  防止大表格中tr td字符串被切分为不同section导致错乱
+			section["body"] = MarkdownTableLinearizer.process(section_body)
+			self.logger.info("检测当前section是否存在表格 进行处理")
+			
+			# 再进行大块切分
 			text_spliter_result = self.split_long_section(section, max_content_length)
 			current_sections.extend(text_spliter_result)
 		self.logger.info(f"Langchain切分大块文档片段后总计{len(current_sections)}个块")
-	
+		
 		# 2. 合并同源小块
-		final_sections = self.merge_short_sections(current_sections,min_content_length)
+		final_sections = self.merge_short_sections(current_sections, min_content_length)
 		self.logger.info(f"合并同源小块文档后总计{len(final_sections)}个块")
 		
 		# 3. 返回切分合并处理后的结果
@@ -318,7 +353,7 @@ class DocumentSplitNode(BaseNode):
 		# 设置初始指针
 		current_section = current_sections[0]
 		final_sections = []
-	
+		
 		for next_section in current_sections[1:]:
 			# 是否同源（多个H1标题源头一定相同 开头文本和第一个H1一定相同 因为它们的父标题都是文档标题）
 			is_same_parent = current_section.get("parent_title") == next_section.get("parent_title")
@@ -332,7 +367,7 @@ class DocumentSplitNode(BaseNode):
 				final_sections.append(current_section)
 				# 更新指针 用于下一次遍历
 				current_section = next_section
-				
+		
 		"""
 		解决最后一次for循环遍历完成后遗留current_section未添加到数组的问题
 		12 34 45 7  遍历到next为7的时候 发现加不进去了将45合并 然后curr变为7 循环结束 加入7
@@ -342,14 +377,47 @@ class DocumentSplitNode(BaseNode):
 			final_sections.append(current_section)
 		
 		return final_sections
+	
+	def assemble_chunks(self, section_list):
+		"""
+		组装最终喂给向量模型的数据
+		Args:
+			section_list:
+
+		Returns:
+
+		"""
+		self.log_step(step_name="STEP-6", message="组装数据准备提交给向量Embedding模型")
+		chunks = []
+		
+		for section in section_list:
+			section_title = section.get("title", "")
+			section_body = section.get("body", "")
+			section_parent_title = section.get("parent_title", "")
+			section_file_title = section.get("file_title", "")
+			section_part = section.get("part", "")
+			
+			chunk = {
+				"content": f"{section_title}\n\n{section_body}",
+				"parent_title": section_parent_title,
+				"file_title": section_file_title,
+			}
+			
+			if section_part:
+				chunk["part"]=section_part
+			
+			chunks.append(chunk)
+			
+		return chunks
+
 
 if __name__ == "__main__":
 	setup_logging()
 	node = DocumentSplitNode()
-	with open("/Users/artest/Desktop/shopkeeper/knowledge/test/test.md", 'r', encoding="utf-8") as file:
+	with open("/Users/artest/Desktop/shopkeeper/output/万用表RS-12的使用/hybrid_auto/万用表RS-12的使用.md", 'r', encoding="utf-8") as file:
 		content = file.read()
 	node.process({
-		"file_title": "test.md",
+		"file_title": "万用表RS-12的使用.md",
 		"md_content": content,
-		"md_path": "/Users/artest/Desktop/shopkeeper/knowledge/test/test.md"
+		"md_path": "/Users/artest/Desktop/shopkeeper/output/万用表RS-12的使用/hybrid_auto/万用表RS-12的使用.md"
 	})
