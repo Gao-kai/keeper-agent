@@ -22,12 +22,14 @@ from knowledge.processor.import_process.log_config import setup_logging
 from knowledge.processor.import_process.state import ImportGraphState
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+
 class DocumentSplitNode(BaseNode):
 	name = "document_split_node"
 	
 	def process(self, state: T) -> T:
 		"""
 		文档切分节点
+		
 		一切目的减少LLM的幻觉，提高检索命中率
 		1. 切分后文档块嵌入语义模型更加准确
 		2. 注入元数据，方便溯源
@@ -45,25 +47,22 @@ class DocumentSplitNode(BaseNode):
 		config = get_import_config()
 		md_content, md_file_name, file_title, max_content_length, min_content_length = self.get_node_info(state, config)
 		
-		# 2. 根据MD标题切分
+		# 2. 先根据MD标题H1-H6切分为若干个Section
 		section_list, has_title = self.splitMarkDownByHeader(md_content, md_file_name)
-		print(json.dumps(section_list, ensure_ascii=False, indent=4))
 		
-		# 3. 处理全文无任意H1-H6标题的情况
+		
+		# 3. 处理全文无任意一个H1-H6标题的情况
+		if not has_title:
+			section_list = [{"title": "无标题", "body": md_content, "file_title": file_title,"parent_title":file_title}]
+			self.logger.info("全文无标题，作为单个 chunk 处理")
 		
 		# 4. 对于过大或者过小的section进行二次切分或者合并
-		section_list = self.split_and_merge_section(section_list,max_content_length,min_content_length)
-	
-	# 2. section块太长 基于langchain实现二次切分
-	# 先切分 然后遍历 看比chunk size是大还是小 大的话继续切 小的话直接加入数组
-	# 全部切完之后进行merge操作 尝试依次将每一个块进行累加 如果小于chunk size继续加 大于则处理重叠然后加到下一个块里面
-	# 2. section块太短 尽可能合并同源信息
-	# 每一个都小 所有加起来都小
-	# 调试langchian源码
-	
-	# 3. 组装提交给Embedding模型的文本
-	
-	# 4. 更新状态state
+		section_list = self.split_and_merge_section(section_list, max_content_length, min_content_length)
+		print(json.dumps(section_list, ensure_ascii=False, indent=4))
+		
+		# 5. 组装提交给Embedding模型的文本
+		
+		# 4. 更新状态state
 	def get_node_info(self, state: ImportGraphState, config):
 		self.log_step(step_name="STEP-1", message="获取节点信息")
 		md_content = state.get("md_content", "")
@@ -83,12 +82,17 @@ class DocumentSplitNode(BaseNode):
 	def splitMarkDownByHeader(self, md_content, md_file_name: str):
 		"""
 		基于正则匹配Header后按照H1-H6切分
+		
+		特殊处理：
+			1. 对于文档不是以Header标题开头（一上来就是正文）那么以文档名称作为section的title和parent_title
+			2. 对于H1标题的section，其parent_title设置为当前文档的名称
+			
 		Args:
 			md_content: MD内容
 			md_file_name: 文档名称
 
 		Returns:
-		
+			sections：List 文档片段列表
 		"""
 		self.log_step(step_name="STEP-2", message="基于正则匹配截取Markdown")
 		md_lines: List[str] = md_content.split("\n")
@@ -118,9 +122,10 @@ class DocumentSplitNode(BaseNode):
 					if parent_title:
 						break
 				
+				# 一级标题 or 一上来就是文本 此时父标题为空 默认设为文档标题
 				if not parent_title:
 					parent_title = md_file_name
-				
+			
 				section_list.append({
 					"title": current_title or md_file_name,
 					"body": prev_body_text,
@@ -190,56 +195,63 @@ class DocumentSplitNode(BaseNode):
 	
 	def split_and_merge_section(self, section_list, max_content_length, min_content_length):
 		"""
-		二次切分场景
-		1. 文档块过大，防止语义被稀释
+		二次切分场景（某一个section的body内容超出最大长度，需要给予LangChain进行二次切分）
+		1. 文档块过大，防止语义被稀释,
 		2. 需要自定义元数组
 		
-		二次合并场景：
+		二次合并场景（连续的若干个section的块都比较小，需要对来自同一标题下的section的body进行合并）
 		1. 多个同源标题下小块可以合并
 		2. 代词在上下文中连续出现，合并有利于精确定位代词
 		3. 合并块不能超出模型的边界阈值
 		4. 元数组和跨权限的数据不能合并
+		
 		Args:
-			section_list:
-			max_content_length:
-			min_content_length:
+			section_list: 基于H1-H6标题切分后返回的列表
+			max_content_length: 配置最大长度
+			min_content_length: 配置最小长度
 
 		Returns:
+			result: List
 
 		"""
 		self.log_step(step_name="STEP-3", message="二次切分和合并块")
 		
 		current_sections = []
 		
-		# 1. 切分
+		# 1. 切分大块
 		for section in section_list:
-			current_sections.extend(self.split_long_section(section,max_content_length))
-		print(current_sections)
-		# 2. 合并
-		final_sections = self.merge_short_sections(current_sections,min_content_length)
-		
-		# return final_sections
+			text_spliter_result = self.split_long_section(section, max_content_length)
+			current_sections.extend(text_spliter_result)
+		self.logger.info(f"Langchain切分大块文档片段后总计{len(current_sections)}个块")
 	
-	def split_long_section(self, section, max_content_length)->List[Dict[str,Any]]:
+		# 2. 合并同源小块
+		final_sections = self.merge_short_sections(current_sections,min_content_length)
+		self.logger.info(f"合并同源小块文档后总计{len(final_sections)}个块")
+		
+		# 3. 返回切分合并处理后的结果
+		return final_sections
+	
+	def split_long_section(self, section, max_content_length) -> List[Dict[str, Any]]:
 		"""
-		切分长的section
+		切分长的section块
+		
 		Args:
-			section:
-			max_content_length:
+			section: Dict[str,str] 文档片段对象
+			max_content_length: 片段最大长度
 
 		Returns:
-
+			sub_sections：切分后的section片段列表
 		"""
-		self.log_step(step_name="STEP-4",message=f"切分section{section.get("title","")}")
+		self.log_step(step_name="STEP-4", message=f"使用LangChain 文本切分器尝试切分大片段")
 		
-		section_title = section.get("title","")
-		section_body = section.get("body","")
+		section_title = section.get("title", "")
+		section_body = section.get("body", "")
 		section_parent_title = section.get("parent_title", "")
 		section_file_title = section.get("file_title", "")
 		
 		# 获取Title加上Body的总长度 小于最大长度 直接返回不进行二次切分
 		section_title = f"{section_title}\n\n"
-		total_length = len(section_body) + len(section_title) # 2800个字符
+		total_length = len(section_body) + len(section_title)  # 2800个字符
 		if total_length <= max_content_length:
 			return [section]
 		
@@ -248,20 +260,19 @@ class DocumentSplitNode(BaseNode):
 		
 		# Edge Case：如果section标题长度大于最大长度 这种块直接返回 因为我们处理的是body 不是title
 		if available_chunk_size <= 0:
-			return  [section]
+			return [section]
 		
 		# 基于langchain的text--spliter进行切分
-
+		
 		text_spliter = RecursiveCharacterTextSplitter(
 			chunk_size=available_chunk_size,
 			chunk_overlap=0,
 			length_function=len,
-			separators=["\n\n", "\n", " ", "。","!","?","，",",",".",""],
+			separators=["\n\n", "\n", " ", "。", "!", "?", "，", ",", ".", ""],
 			keep_separator=False
 		)
 		
-		
-		chunks:List[str] = text_spliter.split_text(section_body)
+		chunks: List[str] = text_spliter.split_text(section_body)
 		# 如果二次切分出来还是一整块 那么无需再次处理 直接返回原section
 		# TODO：Langchain split_text源码 每一段都小于chunk_size 加起来也小于chunk_size
 		if len(chunks) <= 1:
@@ -269,30 +280,68 @@ class DocumentSplitNode(BaseNode):
 		
 		# 如果二次切分后多块 那么二次构建section
 		sub_sections = []
-		for index,chunk in enumerate(chunks):
+		for index, chunk in enumerate(chunks):
 			sub_sections.append({
-				"title": f"{section_title}-{index+1}",
+				"title": f"{section_title}-{index + 1}",
 				"body": chunk,
 				"parent_title": section_parent_title,
 				"file_title": section_file_title,
-				"part": f"{index+1}"
+				"part": f"{index + 1}"
 			})
-		
 		
 		return sub_sections
 	
 	def merge_short_sections(self, current_sections, min_content_length):
 		"""
+		贪心累加思想
+		1. 判断当前section和遍历到的下一个section是否同源
+			- parent title相同 说明是一个H标题下的子节点
+			- parent title不相同 语义不一致 不进行合并
+		2. 再次判断当前累加的section body长度是否小于配置的片段最小值
 		
+		满足上述1和2条件: 需要进行合并
+		不满足1和2条件：
+			1. 更新指针curr_section
+			2. 说明这个section不需要处理，直接加入到结果数组中，
 		Args:
-			current_sections:
-			min_content_length:
+			current_sections: langchain切分大文本后返回的所有片段列表（保证所有片段长度不会超出最大配置length）
+			min_content_length: 最小值
 
 		Returns:
+			results：合并处理后的最终section列表
 
 		"""
-		return []
-
+		self.log_step(step_name="STEP-5", message=f"尝试合并小片段chunks")
+		if not current_sections:
+			return current_sections
+		
+		# 设置初始指针
+		current_section = current_sections[0]
+		final_sections = []
+	
+		for next_section in current_sections[1:]:
+			# 是否同源（多个H1标题源头一定相同 开头文本和第一个H1一定相同 因为它们的父标题都是文档标题）
+			is_same_parent = current_section.get("parent_title") == next_section.get("parent_title")
+			
+			# 如果满足：1. 相同父标题表示来自同一父节点下面 2. 当前section的长度小于最小section长度
+			if is_same_parent and len(current_section.get("body", "")) < min_content_length:
+				# 当前section的body吃掉下一个section的body
+				current_section["body"] = current_section["body"].rstrip() + "\n\n" + next_section["body"].lstrip()
+			else:
+				# 不满足条件则加入到结果数组中
+				final_sections.append(current_section)
+				# 更新指针 用于下一次遍历
+				current_section = next_section
+				
+		"""
+		解决最后一次for循环遍历完成后遗留current_section未添加到数组的问题
+		12 34 45 7  遍历到next为7的时候 发现加不进去了将45合并 然后curr变为7 循环结束 加入7
+		12 34 56 78 遍历到next为8的时候 发现可以加进去78合并 循环结束 加入78
+		"""
+		if current_section:
+			final_sections.append(current_section)
+		
+		return final_sections
 
 if __name__ == "__main__":
 	setup_logging()
