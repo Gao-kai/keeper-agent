@@ -23,21 +23,28 @@ Milvus各种集合的名称
 稠密索引COS 余弦相似度
 稀疏索引IP 内积
 
+Milvus这块得花时间
+
 """
 import json
-from typing import List, Optional, Tuple, Any
+import os
+from typing import List, Optional, Tuple, Any, Dict
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
+from pymilvus import MilvusClient, DataType
 
 from knowledge.processor.import_process.base import BaseNode, T
 from knowledge.processor.import_process.config import get_import_config, ImportConfig
-from knowledge.processor.import_process.exception import ValidationError, ConfigurationError, EmbeddingError
+from knowledge.processor.import_process.exception import ValidationError, ConfigurationError, EmbeddingError, \
+	MilvusError
 from knowledge.processor.import_process.state import ImportGraphState
 from knowledge.prompts.import_prompt import ITEM_NAME_SYSTEM_PROMPT, ITEM_NAME_USER_PROMPT_TEMPLATE
 from knowledge.utils.bge_m3_embedding_model import get_bge_m3_embedding_model
 from knowledge.utils.llm_client import get_llm_client
 from pymilvus.model.hybrid import BGEM3EmbeddingFunction
+
+from knowledge.utils.milvus_client import get_milvus_client
 
 
 class ItemNameRecognitionNode(BaseNode):
@@ -58,8 +65,13 @@ class ItemNameRecognitionNode(BaseNode):
 		dense_vector, sparse_vector = self.embedding_item_name(item_name)
 		
 		# 5. 存入Milvus向量数据库
+		self.save_to_milvus(item_name, file_title, dense_vector, sparse_vector, config)
 		
-		# 6. 更新state
+		# 6. 更新state和chunk
+		for chunk in chunks:
+			chunk["item_name"] = item_name
+		
+		state["item_name"] = item_name
 		return state
 	
 	def validate_inputs(self, state: ImportGraphState):
@@ -179,13 +191,125 @@ class ItemNameRecognitionNode(BaseNode):
 			print(f"稀疏向量的非零元素的权重列表：{weights}")
 			print(f"稀疏向量的非零元素的TokenID列表：{token_ids}")
 			
-			# 打包成字典
+			# 打包成字典 {tokenId:weight}
 			sparse_vector = dict(zip(token_ids, weights))
 			
 			return dense_vector, sparse_vector
 		
 		except Exception as e:
 			raise EmbeddingError(f"商品名称{item_name}嵌入失败: {e}")
+	
+	def save_to_milvus(self,
+	                   item_name: str,
+	                   file_title: str,
+	                   dense_vector: List[float],
+	                   sparse_vector: Dict[Any, Any],
+	                   config: ImportConfig):
+		
+		self.log_step(step_name="STEP-5", message="存储商品名称稀疏向量和稠密向量到Milvus向量数据库")
+		
+		if not dense_vector and not sparse_vector:
+			self.logger.warning("Milvus 配置不完整，跳过保存")
+			return
+		
+		try:
+			# 连接Milvus服务
+			milvus_client = get_milvus_client(uri=os.getenv("MILVUS_URL"))
+			
+			if milvus_client is None:
+				raise MilvusError(node_name=self.name, message="初始化Milvus客户端失败")
+			
+			# 创建集合
+			collection_name = config.item_name_collection
+			
+			if not milvus_client.has_collection(collection_name=collection_name):
+				self.create_item_name_collection(milvus_client, collection_name)
+			
+			# 构建数据
+			data: Dict[str, Any] = {
+				"item_name": item_name,
+				"file_title": file_title
+			}
+			
+			if dense_vector is not None:
+				data["item_name_dense_vector"] = dense_vector
+			
+			if sparse_vector is not None:
+				data["item_name_sparse_vector"] = sparse_vector
+			
+			# 插入集合(data可以是一条数据也可以数据组成的列表)
+			inserted_response = milvus_client.insert(
+				collection_name=collection_name,
+				data=data
+			)
+			
+			# 插入数据后，强制刷新数据到磁盘
+			milvus_client.flush(collection_name=collection_name)
+			
+			self.logger.info(f"商品{item_name}向量插入到集合{collection_name}成功")
+		
+		except Exception as e:
+			self.logger.error(f"存储商品名称向量到Milvus数据库失败:{e}")
+	
+	def create_item_name_collection(self, milvus_client: MilvusClient, collection_name: str):
+		# 创建Schema
+		schema = milvus_client.create_schema(enable_dynamic_field=True)
+		
+		# 添加主键字段
+		schema.add_field(
+			field_name="item_id",
+			datatype=DataType.INT64,
+			is_primary=True,
+			auto_id=True
+		)
+		
+		# 添加标量字段
+		schema.add_field(
+			field_name="item_name",
+			datatype=DataType.VARCHAR,
+			max_length=1024
+		)
+		schema.add_field(
+			field_name="file_title",
+			datatype=DataType.VARCHAR,
+			max_length=1024
+		)
+		
+		# 添加稠密向量字段
+		schema.add_field(
+			field_name="item_name_dense_vector",
+			datatype=DataType.FLOAT_VECTOR,
+			dim=1024
+		)
+		
+		# 添加稀疏向量字段
+		schema.add_field(
+			field_name="item_name_sparse_vector",
+			datatype=DataType.SPARSE_FLOAT_VECTOR,
+		)
+		
+		# 添加集合索引(稀疏向量&稠密向量)
+		index_params = milvus_client.prepare_index_params()
+		index_params.add_index(
+			index_name="item_name_dense_vector_index",
+			index_type="IVF_FLAT",
+			field_name="item_name_dense_vector",
+			metric_type="COSINE",
+			params={
+				"nlist": 64
+			}
+		)
+		index_params.add_index(
+			index_name="item_name_sparse_vector_index",
+			index_type="SPARSE_INVERTED_INDEX",
+			field_name="item_name_sparse_vector",
+			metric_type="IP"
+		)
+		
+		collection = milvus_client.create_collection(collection_name=collection_name, index_params=index_params,
+		                                             schema=schema)
+		self.logger.info(f"创建商品名称集合向量成功，集合名称：{collection_name}")
+		return collection
 
 
 if __name__ == "__main__":
