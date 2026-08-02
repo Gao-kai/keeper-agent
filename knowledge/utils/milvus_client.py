@@ -1,4 +1,6 @@
 # 创建Milvus客户端
+from typing import Optional
+
 from pymilvus import MilvusClient
 from logging import INFO
 from langchain_openai import ChatOpenAI
@@ -24,7 +26,7 @@ load_dotenv(override=True)
 # # 最小余弦相似度阈值
 # MILVUS_MIN_COSINE_SCORE = 0.75
 
-milvus_client: MilvusClient
+milvus_client: Optional[MilvusClient]  = None
 def get_milvus_client(uri: str):
 	try:
 		global milvus_client

@@ -5,25 +5,20 @@
 调用BGE-M3模型生成稀疏向量和稠密向量存入Milvus向量数据库，
 增加用户在询问和商品名相关问题时召回率和精确度。
 
-非流式输出时千问模型必须强制设置enabled-thinks为false
-LLM的缓存封装
+# 为什么要提取商品名？
+RAG的最终目的是尽可能的将能够检索的内容检索出来，提高检索召回率，降低RAG幻觉，也就是不该检索的不要检索出来。
+因此我们需要将哪些可以唯一代表上下文信息尽可能的注入到chunk块中或者插入到元数据位置，以便检索时的精确定位。
 
-- response_format=True （开 JSON 模式）
-- 在 prompt 里出现 "json" 字样，例如把 system prompt 改成 "请以 JSON 格式输出，不要输出 Markdown 或解释"
+1. 用户提问后第一个环节是商品名确认阶段，这个阶段需要拿着用户问题的向量和存在商品名向量库中的向量检索，确认好用户到底想咨询哪一个商品的问题
+2. 真正的检索阶段，由于chunk中都有对应的商品名，可以更精确的定位到用户问题和chunk的语义相关性。
 
-稀疏向量（关键词相似检索，但是容易出现苹果和苹果手机混淆的概念）和稠密向量（模糊语义相似检索，但是容易不能精确定位到专有名词）
-模型参数BGE-3
-encode_queries
-encode_documents
-dense Numpy数组对象 默认维度1024
-sparse 压缩行矩阵  250002
-
-Milvus各种索引的使用
-Milvus各种集合的名称
-稠密索引COS 余弦相似度
-稀疏索引IP 内积
-
-Milvus这块得花时间
+TODO
+1. LLM模型配置时的enabled-think和 response_format参数，非流式输出时千问模型必须强制设置enabled-thinks为false
+2. BGE-M3模型 稀疏向量（关键词相似检索，但是容易出现苹果和苹果手机混淆的概念）和稠密向量（模糊语义相似检索，但是容易不能精确定位到专有名词）
+3. 单例和幂等性判断
+4. BGE-M3返回的dense和sparse向量的进一步处理
+5. Milvus中各种索引的底层知识
+6. Milvus中各种距离测量标准COS和IP等
 
 """
 import json
@@ -311,15 +306,33 @@ class ItemNameRecognitionNode(BaseNode):
 		self.logger.info(f"创建商品名称集合向量成功，集合名称：{collection_name}")
 		return collection
 
+"""
+带s的表示和字符串有关
+json.loads 将json字符串反序列化为json对象
+json.dumps 将json对象序列化为字符串
 
+不带s的表示和文件对象有关
+json.load(f) 从文件对象中读取后反序列化为json为json对象
+json.dump(data,f) 将json对象data序列化为字符串后写入文件
+
+load表示加载 将外部字符串转化为内存的对象 反序列化
+dump表示写出 将内存对象序列化为字符串 序列化
+"""
 if __name__ == "__main__":
 	item_name_recognition_node = ItemNameRecognitionNode()
 	with open("/Users/artest/Desktop/shopkeeper/output/万用表RS-12的使用/hybrid_auto/chunks.json", "r",
 	          encoding="utf-8") as f:
-		chunks_json = f.read()
-		chunks_ = json.loads(chunks_json)
+		chunk_contents = json.load(f)
 	
-	item_name_recognition_node.process({
-		"chunks": chunks_,
+	state = item_name_recognition_node.process({
+		"chunks": chunk_contents,
 		"file_title": "万用表RS-12的使用"
 	})
+	
+	chunks = state["chunks"]
+	
+	with open("/Users/artest/Desktop/shopkeeper/output/万用表RS-12的使用/hybrid_auto/chunks_vector.json", "w",
+	          encoding="utf-8") as f:
+		json.dump(chunks,f,ensure_ascii=False,indent=4)
+	print(f"商品名向量化后的chunks数据保存至:/Users/artest/Desktop/shopkeeper/output/万用表RS-12的使用/hybrid_auto/chunks_vector.json")
+	
