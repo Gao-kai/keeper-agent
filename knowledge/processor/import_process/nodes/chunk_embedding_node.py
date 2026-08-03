@@ -133,6 +133,3 @@ if __name__ == "__main__":
 		json.dump(_chunks, f, ensure_ascii=False, indent=4)
 	print(
 		f"切片数据向量化后的chunks数据保存至:/Users/artest/Desktop/shopkeeper/output/万用表RS-12的使用/hybrid_auto/chunks_vector.json")
-
-
-
