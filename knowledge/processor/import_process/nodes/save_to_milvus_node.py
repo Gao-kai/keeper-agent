@@ -21,12 +21,11 @@ Milvus的约束：
 1. 主键唯一
 2. 向量字段基本唯一
 3. 标量字段会经常更新
-
-zip
-dataclass
 """
 
-
+"""
+创建Milvus Schema类
+"""
 class MilvusSchemaBuilder:
 	@staticmethod
 	def build(milvus_client: MilvusClient, vector_dim: int):
@@ -69,7 +68,9 @@ class MilvusSchemaBuilder:
 		# 返回构建完成的schema
 		return schema
 
-
+"""
+创建Milvus 索引Index类
+"""
 class MilvusIndexBuilder:
 	@staticmethod
 	def build(milvus_client: MilvusClient):
@@ -93,7 +94,9 @@ class MilvusIndexBuilder:
 		
 		return index_params
 
-
+"""
+创建Milvus插入数据类
+"""
 class MilvusInserterBuilder:
 	@staticmethod
 	def build(milvus_client: MilvusClient, collection_name: str, chunks: List[Dict[str, any]]):
@@ -113,7 +116,6 @@ class MilvusInserterBuilder:
 添加dataclass自动实现init方法、repr方法
 """
 
-
 @dataclass(frozen=True)
 class ScalarFieldSpec:
 	file_name: str
@@ -121,7 +123,9 @@ class ScalarFieldSpec:
 	max_length: int = None
 	nullable: bool = False
 
-
+"""
+定义全局标量字段列表
+"""
 SCALAR_FIELDS: Sequence[ScalarFieldSpec] = (
 	ScalarFieldSpec(file_name="content", datatype=DataType.VARCHAR, max_length=65535),
 	ScalarFieldSpec(file_name="file_title", datatype=DataType.VARCHAR, max_length=1024),
@@ -150,11 +154,10 @@ class SaveToMilvusNode(BaseNode):
 		self.ensure_collection(milvus_client, collection_name, vector_dim)
 		
 		# 4. 存入向量数据库并且回填chunk_id 主键
-		
-		ids,chunks = self.insert_milvus(milvus_client, collection_name, validated_chunks)
+		ids, chunks = self.insert_milvus(milvus_client, collection_name, validated_chunks)
 		
 		# 5. 回填ID
-		filled_chunks = self.fill_in_primary_key_to_chunk(ids,chunks )
+		filled_chunks = self.fill_in_primary_key_to_chunk(ids, chunks)
 		state["chunks"] = filled_chunks
 		
 		return state
@@ -203,7 +206,7 @@ class SaveToMilvusNode(BaseNode):
 		result = MilvusInserterBuilder.build(milvus_client, collection_name, chunks)
 		insert_count = result.get("insert_count", 0)
 		ids = result.get("ids", [])
-		return ids,chunks
+		return ids, chunks
 	
 	def fill_in_primary_key_to_chunk(self, ids: List[int], chunks: List[Dict[str, any]]):
 		self.log_step(step_name="STEP-5", message=f"执行回填 将插入后的主键ID写到chunk中")

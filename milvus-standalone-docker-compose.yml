@@ -60,6 +60,7 @@ services:
     depends_on:
       - "etcd"
       - "minio"
+
   # ================= 新增 Attu 服务 =================
   attu:
     container_name: shopkeeper-milvus-attu
