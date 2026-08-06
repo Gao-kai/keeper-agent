@@ -6,7 +6,6 @@ Neo4J 图数据库
 4. 增删改查操作
 5. 完成电商图谱的案例
 6. 事务保证要么全部成功要么全部失败
-
 """
 import os
 from typing import Optional, Tuple
@@ -37,10 +36,10 @@ def create_neo4j_client(uri: str, auth: Tuple[str, str], database: str):
 		return neo4j_driver
 	except Exception as e:
 		raise Neo4jError(f"远程连接NEO4J服务失败{e}")
-	
-# 3. 创建分类节点
+
+
+# 创建分类节点
 def create_category_node(neo4j_driver):
-	
 	categories = [
 		"电子产品",
 		"食品饮料",
@@ -61,7 +60,8 @@ def create_category_node(neo4j_driver):
 	except Exception as e:
 		raise Neo4jError(f"分类节点创建失败：{e}")
 
-# 4. 创建商品节点并关联每一个商品的分类节点
+
+# 创建商品节点并关联每一个商品的分类节点
 def create_product_node_and_relate(neo4j_driver):
 	products = [
 		{"name": "华为手机", "price": 5999, "cat": "电子产品"},
@@ -88,7 +88,8 @@ def create_product_node_and_relate(neo4j_driver):
 	
 	print("✅成功创建商品节点并关联每一个商品的分类节点")
 
-# 5. 创建客户节点
+
+# 创建客户节点
 def create_custom_nodes(neo4j_driver):
 	customers = [
 		{"name": "张三", "age": 28, "vip": True},
@@ -110,7 +111,8 @@ def create_custom_nodes(neo4j_driver):
 		)
 	print("✅客户节点创建成功")
 
-# 6. 建立客户和商品之间的购买关系以及购买价格
+
+# 建立客户和商品之间的购买关系以及购买价格
 def create_custom_product_relation(neo4j_driver):
 	relations = [
 		("张三", "华为手机", 5999),
@@ -137,7 +139,8 @@ def create_custom_product_relation(neo4j_driver):
 		)
 	print("✅ 成功建立客户和商品之间的购买关系以及购买价格")
 
-# 7. 建立客户之间朋友关系
+
+# 建立客户之间朋友关系
 def create_friends_relations(neo4j_driver):
 	friends = [
 		("张三", "李四"),
@@ -164,6 +167,7 @@ def create_friends_relations(neo4j_driver):
 
 if __name__ == "__main__":
 	config = get_import_config()
+	
 	# 1. 建立数据库Neo4j连接
 	neo4j_driver = create_neo4j_client(
 		uri=config.neo4j_uri,
@@ -173,11 +177,77 @@ if __name__ == "__main__":
 	database = config.neo4j_database
 	
 	# 2. 清空旧数据
-	neo4j_driver.execute_query("""MATCH (n) DETACH DELETE (n)""")
+	# neo4j_driver.execute_query("""MATCH (n) DETACH DELETE (n)""")
+	
+	# 3. 创建节点和数据
+	# create_category_node(neo4j_driver)
+	# create_product_node_and_relate(neo4j_driver)
+	# create_custom_nodes(neo4j_driver)
+	# create_custom_product_relation(neo4j_driver)
+	# create_friends_relations(neo4j_driver)
+	
+	# 查询1 用户为张三的所有购买记录
+	r1 = neo4j_driver.execute_query(
+		query_="""
+		MATCH (c:Custom {name: $name})-[r:BUY]->(p:Product)
+		RETURN p.name AS 产品名称, count(p) AS 产品数量, p.price AS 价格
+		""",
+		parameters_={
+			"name": "张三"
+		},
+		database_=database
+	)
+	
+	# {'产品名称': '进口咖啡', '产品数量': 1, '价格': 89}
+	# {'产品名称': '华为手机', '产品数量': 1, '价格': 5999}
+	
+	for record in r1.records:
+		print(record.data())
+		
+	# 查询2 华为手机属于哪个分类
+	r2 = neo4j_driver.execute_query(
+		query_="""
+		MATCH (p:Product {name: $name})-[r:BELONGS_TO]->(c:Category)
+		RETURN c
+		""",
+		parameters_={
+			"name":"华为手机"
+		},
+		database_=database
+	)
 
-	# 创建操作
-	create_category_node(neo4j_driver)
-	create_product_node_and_relate(neo4j_driver)
-	create_custom_nodes(neo4j_driver)
-	create_custom_product_relation(neo4j_driver)
-	create_friends_relations(neo4j_driver)
+	# {'c': {'name': '电子产品'}}
+	for record in r2.records:
+		print(record.data())
+	
+	# 查询3 所有VIP客户
+	r3 = neo4j_driver.execute_query(
+		query_="""
+		MATCH (c:Custom)
+		WHERE c.vip=true
+		RETURN c.name AS VIP客户,c.age AS 年龄
+		""",
+		database_=database,
+	)
+	for record in r3.records:
+		print(record.data())
+	
+	
+	# 查询4 张三的朋友购买过但是张三本人没有购买的产品
+	r4 = neo4j_driver.execute_query(
+		query_="""
+		MATCH (c1:Custom {name: $name})-[:FRIEND]->(c2:Custom)
+		WITH c2,c1
+		MATCH (c2:Custom)-[r:BUY]->(p:Product)
+		WHERE NOT EXISTS {(c1)-[:BUY]->(p)}
+		RETURN p.name AS 商品名称,count(p) AS 商品数量,c2.name AS 好友名称
+		""",
+		database_=database,
+		parameters_={
+			"name":"张三"
+		}
+	)
+	
+	for record in r4.records:
+		print(record.data())
+
