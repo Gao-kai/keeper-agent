@@ -16,22 +16,52 @@
 	
 TODO: 最佳实践是构建“混合流水线
 """
+import json
+import re
 import time
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Set
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from neo4j import Driver
 from pymilvus import MilvusClient
 
 from knowledge.processor.import_process.base import BaseNode, T
-from knowledge.processor.import_process.config import get_import_config
+from knowledge.processor.import_process.config import get_import_config, ImportConfig
 from knowledge.processor.import_process.exception import ValidationError, LLMError
 from knowledge.processor.import_process.state import ImportGraphState
 from knowledge.prompts.import_prompt import KNOWLEDGE_GRAPH_SYSTEM_PROMPT
 from knowledge.utils.llm_client import get_llm_client
 from knowledge.utils.milvus_client import get_milvus_client
 from knowledge.utils.neo4j_client import get_neo4j_client
+
+# 实体Label白名单
+ALLOWED_ENTITY_LABEL_TYPES = {
+	"Device",
+	"Part",
+	"Operation",
+	"Step",
+	"Warning",
+	"Condition",
+	"Tool"
+}
+
+# 实体关系类型白名单
+ALLOWED_RELATION_TYPES = {
+	"HAS_OPERATION",
+	"HAS_PART",
+	"HAS_STEP",
+	"USES_TOOL",
+	"HAS_WARNING",
+	"NEXT_STEP",
+	"AFFECTS",
+	"REQUIRES",
+	"MENTIONED_IN",
+	"RELATED_TO",
+}
+
+# 默认关系类型
+DEFAULT_RELATION_TYPE = "RELATED_TO"
 
 
 @dataclass
@@ -162,20 +192,38 @@ class KnowledgeGraphNode(BaseNode):
 				self.logger.error(f"处理{chunk_id}图谱构建失败")
 	
 	def process_single_chunk(self, chunk: Dict[str, Any], milvus_client: MilvusClient, neo4j_client: Driver):
+		chunk_id = chunk.get("chunk_id")
+		config = get_import_config()
 		
 		# 1. 调用LLM模型提取当前chunk的实体和关系[重试机制]
-		llm_reponse = self.extract_graph_with_retry(chunk)
-	
-	# 2. 解析并清洗LLM返回结果
+		llm_response = self.extract_graph_with_retry(chunk, config)
+		
+		if not llm_response:
+			return
+		
+		# 2. 解析并清洗LLM返回结果
+		graph_data: Dict[str, List] = self.parse_and_clean_llm_result(llm_response, config)
+		
+		if not graph_data:
+			return
+		
+		self.logger.info(f"切片 {chunk_id}的切片: "
+		                 f"提取到 {len(graph_data['entities'])} 个实体\n"
+		                 f"提取到 {len(graph_data['relations'])} 条关系")
+		
 	
 	# 3. 将清洗后的实体名字写入至Milvus向量数据库【目的：用户提问时先从向量数据库中找到精确实体名称】
 	
 	# 4. 将清洗后的实体名字和关系写入到Neo4j图谱中 【目的：混合检索阶段可以查询到问题中的实体关联关系】
-	def extract_graph_with_retry(self, chunk: Dict[str, Any]):
+	
+	def extract_graph_with_retry(self, chunk: Dict[str, Any], config: ImportConfig):
 		"""
+		TODO: 错误原因、响应为空作为AI Message进行重试的消息列表
 		提供自动重试机制的模型调用
+
 		Args:
 			chunk:
+			config
 
 		Returns:
 
@@ -188,7 +236,6 @@ class KnowledgeGraphNode(BaseNode):
 		if llm_client is None:
 			raise LLMError(node_name=self.name, message="初始化LLM客户端失败")
 		
-		config = get_import_config()
 		llm_errors = []
 		messages = [
 			SystemMessage(content=KNOWLEDGE_GRAPH_SYSTEM_PROMPT),
@@ -216,3 +263,177 @@ class KnowledgeGraphNode(BaseNode):
 			self.logger.error(f"错误信息为:{'\n\n'.join(llm_errors)}")
 		
 		return ""
+	
+	def parse_and_clean_llm_result(self, llm_response: str, config) -> Dict[str, Any]:
+		"""
+		对LLM返回的内容进行校验和清洗：
+		1. 可能包含markdown的json围栏
+		2. 返回的JSON反序列化为字典失败
+		3. 清洗实体列表
+		4. 清洗关系列表
+
+		Args:
+			llm_response:
+			config:
+
+		Returns:
+
+		"""
+		if not llm_response:
+			return {
+				"entities": [],
+				"relations": []
+			}
+		
+		# 消除可能返回的```json```代码围栏
+		cleaned_text = re.sub(r"^```(?:json)?\s*", "", llm_response.strip())
+		cleaned_text = re.sub(r"\s*```$", "", cleaned_text)
+		
+		# json反序列化可能失败
+		try:
+			data: Dict[str, Any] = json.loads(cleaned_text)
+		except json.JSONDecodeError as e:
+			self.logger.error(f"JSON反序列化失败: {e}")
+			return {
+				"entities": [],
+				"relations": []
+			}
+		
+		# 清洗实体列表
+		entities = data.get("entities", [])
+		cleaned_entities = self.clean_entities_from_llm_result(entities, config)
+		cleaned_entity_names: Set[str] = {item["name"] for item in cleaned_entities}
+		
+		# 清洗关系列表
+		relations = data.get("relations", [])
+		cleaned_relations = self.clean_relations_from_llm_result(relations, cleaned_entity_names, config)
+		
+		return {
+			"entities": cleaned_entities,
+			"relations": cleaned_relations
+		}
+	
+	def clean_entities_from_llm_result(self, entities: List[Dict[str, Any]], config: ImportConfig):
+		"""
+		
+		清洗实体名称：
+		2. 实体名称为空
+		3. 实体名称超出长度
+		4. 同一名称同一Label的实体重复提取
+		5. 实体标签Label不存在于白名单中
+		
+		Args:
+			entities:
+			config
+
+		Returns:
+
+		"""
+		
+		if not entities:
+			return []
+		
+		cleaned_entities: List[Dict[str, Any]] = []
+		seen: Set[Tuple] = set()
+		
+		for entity in entities:
+			
+			# 为空判断
+			entity_name = entity.get("name", "")
+			entity_label = entity.get("label", "")
+			if not entity_name or not entity_label:
+				continue
+			
+			# 超出长度截取
+			if len(entity_name) > config.max_entity_name_length:
+				entity_name = entity_name[:config.max_entity_name_length + 1]
+			
+			# 去重
+			entity_unique_key = (entity_name, entity_label)
+			
+			if entity_unique_key in seen:
+				continue
+			seen.add(entity_unique_key)
+			
+			# 实体Label不在白名单
+			if entity_label not in ALLOWED_ENTITY_LABEL_TYPES:
+				continue
+			
+			cleaned_entity = {
+				"name": entity_name,
+				"label": entity_label,
+			}
+			
+			# 是否包含描述
+			entity_desc = entity.get("description", "")
+			if not entity_desc:
+				cleaned_entity["description"] = entity_desc
+			
+			cleaned_entities.append(cleaned_entity)
+		
+		self.logger.info(f"清洗实体完成：{len(cleaned_entities)}")
+		
+		return cleaned_entities
+	
+	def clean_relations_from_llm_result(
+			self,
+			relations: List[Dict[str, Any]],
+			cleaned_entity_names: Set[str],
+			config: ImportConfig
+	):
+		"""
+		清洗关系列表
+		1. 为空
+		2. 长度超出
+		3. 悬空关系
+		
+		Args:
+			relations:
+			cleaned_entity_names:
+			config:
+
+		Returns:
+
+		"""
+		
+		if not relations:
+			return []
+		
+		cleaned_relations: List[Dict[str, Any]] = []
+		
+		for relation in relations:
+			
+			# 为空判断
+			head_entity_name = relation.get("head", "")
+			tail_entity_name = relation.get("tail", "")
+			relation_type = relation.get("type", "")
+			
+			if not head_entity_name or not tail_entity_name:
+				continue
+			
+			# 超出长度截取
+			if len(head_entity_name) > config.max_entity_name_length:
+				head_entity_name = head_entity_name[:config.max_entity_name_length + 1]
+			
+			if len(tail_entity_name) > config.max_entity_name_length:
+				tail_entity_name = tail_entity_name[:config.max_entity_name_length + 1]
+			
+			# 关系类型不在白名单 此时可以给默认关系
+			if relation_type not in ALLOWED_ENTITY_LABEL_TYPES:
+				relation_type = DEFAULT_RELATION_TYPE
+			
+			# 悬空关系：一个关系的头尾节点的名称都不在cleaned_entity_names里面
+			if head_entity_name not in cleaned_entity_names or tail_entity_name not in cleaned_entity_names:
+				continue
+			
+			cleaned_relation = {
+				"head": head_entity_name,
+				"tail": tail_entity_name,
+				"type": relation_type,
+			}
+			
+			cleaned_relations.append(cleaned_relation)
+		
+		self.logger.info(f"清洗关系完成：{len(cleaned_relations)}")
+		
+		return cleaned_relations
