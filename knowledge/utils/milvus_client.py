@@ -27,7 +27,7 @@ load_dotenv(override=True)
 # MILVUS_MIN_COSINE_SCORE = 0.75
 
 milvus_client: Optional[MilvusClient]  = None
-def get_milvus_client(uri: Optional[str]):
+def get_milvus_client(uri: str = ""):
 	try:
 		global milvus_client
 		

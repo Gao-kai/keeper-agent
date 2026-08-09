@@ -9,9 +9,10 @@ load_dotenv(override=True)
 llm_model_cache = {}
 
 def get_llm_client(
-		model: str,
-		temperature: float,
-		response_json: bool = False):
+		model: str = '',
+		temperature: float = 0.1,
+		response_json: bool = False
+):
 	
 	try:
 		# 获取模型参数

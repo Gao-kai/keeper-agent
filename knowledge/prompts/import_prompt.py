@@ -26,7 +26,8 @@ ITEM_NAME_USER_PROMPT_TEMPLATE = """请分析以下文档信息，并严格按�
 【文档内容切片】
 {context}
 
-商品名称："""
+商品名称：
+"""
 
 
 
