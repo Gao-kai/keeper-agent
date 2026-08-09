@@ -24,13 +24,14 @@ from typing import List, Dict, Any, Tuple, Set
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from neo4j import Driver
-from pymilvus import MilvusClient
+from pymilvus import MilvusClient, DataType
 
 from knowledge.processor.import_process.base import BaseNode, T
 from knowledge.processor.import_process.config import get_import_config, ImportConfig
-from knowledge.processor.import_process.exception import ValidationError, LLMError
+from knowledge.processor.import_process.exception import ValidationError, LLMError, MilvusError, EmbeddingError
 from knowledge.processor.import_process.state import ImportGraphState
 from knowledge.prompts.import_prompt import KNOWLEDGE_GRAPH_SYSTEM_PROMPT
+from knowledge.utils.bge_m3_embedding_model import get_bge_m3_embedding_model
 from knowledge.utils.llm_client import get_llm_client
 from knowledge.utils.milvus_client import get_milvus_client
 from knowledge.utils.neo4j_client import get_neo4j_client
@@ -180,11 +181,10 @@ class KnowledgeGraphNode(BaseNode):
 			chunk_id = chunk.get("chunk_id")
 			
 			try:
-				
-				entities_count, relations_count = self.process_single_chunk(chunk, milvus_client, neo4j_client)
+				entities, relations = self.process_single_chunk(chunk, milvus_client, neo4j_client)
 				process_state.processed_chunks += 1
-				process_state.total_entities += entities_count
-				process_state.total_relations += relations_count
+				process_state.total_entities += len(entities)
+				process_state.total_relations += len(relations)
 				self.logger.info(f"成功处理{chunk_id}图谱构建")
 			except Exception as e:
 				process_state.failed_chunks += 1
@@ -199,22 +199,26 @@ class KnowledgeGraphNode(BaseNode):
 		llm_response = self.extract_graph_with_retry(chunk, config)
 		
 		if not llm_response:
-			return
+			return None
 		
 		# 2. 解析并清洗LLM返回结果
 		graph_data: Dict[str, List] = self.parse_and_clean_llm_result(llm_response, config)
 		
 		if not graph_data:
-			return
+			return None
+		
+		entities = graph_data.get("entities", [])
+		relations = graph_data.get("relations", [])
 		
 		self.logger.info(f"切片 {chunk_id}的切片: "
-		                 f"提取到 {len(graph_data['entities'])} 个实体\n"
-		                 f"提取到 {len(graph_data['relations'])} 条关系")
+		                 f"提取到 {len(entities)} 个实体\n"
+		                 f"提取到 {len(relations)} 条关系")
 		
-	
-	# 3. 将清洗后的实体名字写入至Milvus向量数据库【目的：用户提问时先从向量数据库中找到精确实体名称】
-	
-	# 4. 将清洗后的实体名字和关系写入到Neo4j图谱中 【目的：混合检索阶段可以查询到问题中的实体关联关系】
+		# 4. 将清洗后的实体名字写入至Milvus向量数据库【目的：用户提问时先从向量数据库中找到精确实体名称】
+		self.save_entity_names_to_milvus(entities, config)
+		
+		# 5. 将清洗后的实体名字和关系写入到Neo4j图谱中 【目的：混合检索阶段可以查询到问题中的实体关联关系】
+		return entities, relations
 	
 	def extract_graph_with_retry(self, chunk: Dict[str, Any], config: ImportConfig):
 		"""
@@ -437,3 +441,158 @@ class KnowledgeGraphNode(BaseNode):
 		self.logger.info(f"清洗关系完成：{len(cleaned_relations)}")
 		
 		return cleaned_relations
+	
+	def save_entity_names_to_milvus(self, entities: List[Dict[str, Any]], config: ImportConfig):
+		"""
+		存储所有实体名称到Milvus向量数据库
+		Args:
+			entities:
+			config:
+
+		Returns:
+
+		"""
+		try:
+			# 1. client客户端创建
+			milvus_client = get_milvus_client(uri=config.milvus_url)
+			if milvus_client is None:
+				raise MilvusError(node_name=self.name, message="获取Milvus客户端失败")
+			
+			# 2. 构建Collection
+			collection_name = config.entity_name_collection
+			if not milvus_client.has_collection(collection_name=collection_name):
+				self.create_entity_name_collection(milvus_client, collection_name)
+			
+			# 3. 生成数据
+			data_list = []
+			for entity in entities:
+				# 1. 使用BGE-M3本地向量模型将所有实体名称转化为稀疏和稠密向量
+				entity_name = entity.get("name", "")
+				dense_vector, sparse_vector = self.embedding_entity_name(entity_name)
+				
+				data = {
+					"name": entity_name,
+					"label": entity.get("label", ""),
+					"description": entity.get("description", ""),
+				}
+				
+				if dense_vector is not None:
+					data["item_name_dense_vector"] = dense_vector
+				
+				if sparse_vector is not None:
+					data["item_name_sparse_vector"] = sparse_vector
+				
+				data_list.append(data)
+			
+			# 4. 插入集合(data可以是一条数据也可以数据组成的列表)
+			inserted_response = milvus_client.insert(
+				collection_name=collection_name,
+				data=data_list
+			)
+			
+			# 插入数据后，强制刷新数据到磁盘
+			milvus_client.flush(collection_name=collection_name)
+			self.logger.info(f"实体名称向量插入到集合{collection_name}成功")
+		except Exception as e:
+			self.logger.error(f"存储实体名称向量到Milvus数据库失败:{e}")
+	
+	def embedding_entity_name(self, entity_name: str):
+		self.logger.info(f"当前处理的实体名称为: {entity_name}")
+		try:
+			bge_m3_ef = get_bge_m3_embedding_model()
+			queries = [entity_name]
+			query_embeddings = bge_m3_ef.encode_queries(queries)
+			
+			# 获取稠密向量dense
+			dense_vector = query_embeddings['dense'][0].tolist()
+			
+			# 获取稀疏向量CSR
+			sparse_matrix = query_embeddings["sparse"]
+			# 获取第 i 句话非零元素的起止索引
+			start_idx = sparse_matrix.indptr[0]
+			end_idx = sparse_matrix.indptr[1]
+			
+			# 提取对应的 Token IDs 和 权重
+			token_ids = sparse_matrix.indices[start_idx:end_idx].tolist()
+			weights = sparse_matrix.data[start_idx:end_idx].tolist()
+			
+			print(f"稀疏向量的非零元素的索引列表：{start_idx}-{end_idx}")
+			print(f"稀疏向量的非零元素的权重列表：{weights}")
+			print(f"稀疏向量的非零元素的TokenID列表：{token_ids}")
+			
+			# 打包成字典 {tokenId:weight}
+			sparse_vector = dict(zip(token_ids, weights))
+			
+			return dense_vector, sparse_vector
+		
+		except Exception as e:
+			raise EmbeddingError(f"实体名称{entity_name}嵌入失败: {e}")
+	
+	def create_entity_name_collection(self, milvus_client: MilvusClient, collection_name: str):
+		# 创建Schema
+		schema = milvus_client.create_schema(enable_dynamic_field=True)
+		
+		# 添加主键字段
+		schema.add_field(
+			field_name="entity_id",
+			datatype=DataType.INT64,
+			is_primary=True,
+			auto_id=True
+		)
+		
+		# 添加标量字段
+		schema.add_field(
+			field_name="name",
+			datatype=DataType.VARCHAR,
+			max_length=1024
+		)
+		schema.add_field(
+			field_name="label",
+			datatype=DataType.VARCHAR,
+			max_length=1024
+		)
+		schema.add_field(
+			field_name="description",
+			datatype=DataType.VARCHAR,
+			max_length=1024
+		)
+		
+		# 添加稠密向量字段
+		schema.add_field(
+			field_name="entity_name_dense_vector",
+			datatype=DataType.FLOAT_VECTOR,
+			dim=1024
+		)
+		
+		# 添加稀疏向量字段
+		schema.add_field(
+			field_name="entity_name_sparse_vector",
+			datatype=DataType.SPARSE_FLOAT_VECTOR,
+		)
+		
+		# 添加集合索引(稀疏向量&稠密向量)
+		index_params = milvus_client.prepare_index_params()
+		index_params.add_index(
+			index_name="entity_name_dense_vector_index",
+			index_type="IVF_FLAT",
+			field_name="entity_name_dense_vector",
+			metric_type="COSINE",
+			params={
+				"nlist": 64
+			}
+		)
+		index_params.add_index(
+			index_name="entity_name_sparse_vector_index",
+			index_type="SPARSE_INVERTED_INDEX",
+			field_name="entity_name_sparse_vector",
+			metric_type="IP"
+		)
+		
+		collection = milvus_client.create_collection(
+			collection_name=collection_name,
+			index_params=index_params,
+			schema=schema
+		)
+		
+		self.logger.info(f"创建实体名称集合向量成功，集合名称：{collection_name}")
+		return collection
