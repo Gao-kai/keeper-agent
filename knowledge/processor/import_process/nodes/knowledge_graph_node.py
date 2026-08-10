@@ -15,6 +15,7 @@
 	- 将抽取到的实体和关联字段chunk_id以及实体之间的关系全部存入到图谱数据库
 	
 TODO: 最佳实践是构建“混合流水线
+TODO: 不一定需要把所有实体都提取出来 我们的目的是找到原始的chunk块
 """
 import json
 import re
@@ -106,7 +107,7 @@ class KnowledgeGraphNode(BaseNode):
 		# 删除neo4j的整个库下的所有节点和信息
 		milvus_client = get_milvus_client()
 		neo4j_client = get_neo4j_client()
-		self.clear_exist_data(milvus_client, neo4j_client, item_name, process_state)
+		self.clear_exist_data(milvus_client, neo4j_client, item_name, config)
 		
 		# 3. 批量处理遍历chunks【串行】TODO: 多线程版本
 		self.process_all_chunks(validated_chunks, milvus_client, neo4j_client, process_state)
@@ -165,9 +166,37 @@ class KnowledgeGraphNode(BaseNode):
 			milvus_client: MilvusClient,
 			neo4j_client: Driver,
 			item_name: str,
-			process_state: ProcessingState
+			config: ImportConfig
 	):
-		pass
+		"""
+		删除集合collection_name下面：
+		1. 所有item_name为item_name的实体节点
+		2. 所有item_name为item_name的实体和关系节点
+		Args:
+			milvus_client:
+			neo4j_client:
+			item_name:
+			config:
+
+		Returns:
+
+		"""
+		if not milvus_client:
+			raise MilvusError(node_name=self.name,message="Milvus 客户端连接不存在")
+		
+		collection_name = config.entity_name_collection
+		if not collection_name:
+			raise MilvusError(node_name=self.name,message=f"Milvus 集合{collection_name}不存在")
+		
+		try:
+			if milvus_client.has_collection(collection_name):
+				milvus_client.delete(
+					collection_name=collection_name,
+					filter=f"item_name == '{item_name}'"
+				)
+				self.logger.info(f"已清空所有商品名为{item_name}的实体节点")
+		except Exception as e:
+			raise MilvusError(node_name=self.name,message=f"Milvus删除集合失败:{e}")
 	
 	def process_all_chunks(
 			self,
@@ -192,7 +221,8 @@ class KnowledgeGraphNode(BaseNode):
 				self.logger.error(f"处理{chunk_id}图谱构建失败")
 	
 	def process_single_chunk(self, chunk: Dict[str, Any], milvus_client: MilvusClient, neo4j_client: Driver):
-		chunk_id = chunk.get("chunk_id")
+		chunk_id = chunk.get("chunk_id", "")
+		
 		config = get_import_config()
 		
 		# 1. 调用LLM模型提取当前chunk的实体和关系[重试机制]
@@ -215,7 +245,7 @@ class KnowledgeGraphNode(BaseNode):
 		                 f"提取到 {len(relations)} 条关系")
 		
 		# 4. 将清洗后的实体名字写入至Milvus向量数据库【目的：用户提问时先从向量数据库中找到精确实体名称】
-		self.save_entity_names_to_milvus(entities, config)
+		self.save_entity_names_to_milvus(entities, config, chunk)
 		
 		# 5. 将清洗后的实体名字和关系写入到Neo4j图谱中 【目的：混合检索阶段可以查询到问题中的实体关联关系】
 		return entities, relations
@@ -306,6 +336,7 @@ class KnowledgeGraphNode(BaseNode):
 		# 清洗实体列表
 		entities = data.get("entities", [])
 		cleaned_entities = self.clean_entities_from_llm_result(entities, config)
+		# Set结构天然去重特性获取去重后的实体名称构成的集合
 		cleaned_entity_names: Set[str] = {item["name"] for item in cleaned_entities}
 		
 		# 清洗关系列表
@@ -442,7 +473,7 @@ class KnowledgeGraphNode(BaseNode):
 		
 		return cleaned_relations
 	
-	def save_entity_names_to_milvus(self, entities: List[Dict[str, Any]], config: ImportConfig):
+	def save_entity_names_to_milvus(self, entities: List[Dict[str, Any]], config: ImportConfig, chunk: Dict[str, Any]):
 		"""
 		存储所有实体名称到Milvus向量数据库
 		Args:
@@ -463,17 +494,27 @@ class KnowledgeGraphNode(BaseNode):
 			if not milvus_client.has_collection(collection_name=collection_name):
 				self.create_entity_name_collection(milvus_client, collection_name)
 			
-			# 3. 生成数据
-			data_list = []
-			for entity in entities:
+			# 3. 获取BGE-M3本地向量模型
+			bge_m3_ef = get_bge_m3_embedding_model()
+			
+			# 4. 生成数据
+			records = []
+			chunk_content = chunk.get("content", "")
+			chunk_id = chunk.get("chunk_id", "")
+			item_name = chunk.get("item_name", "")
+			
+			# 5. 对entities进行去重
+			unique_entity_names: Set[str] = {entity["name"] for entity in entities}
+			for entity_name in unique_entity_names:
 				# 1. 使用BGE-M3本地向量模型将所有实体名称转化为稀疏和稠密向量
-				entity_name = entity.get("name", "")
-				dense_vector, sparse_vector = self.embedding_entity_name(entity_name)
+				dense_vector, sparse_vector = self.embedding_entity_name(entity_name, bge_m3_ef)
 				
+				# 2. 填充
 				data = {
-					"name": entity_name,
-					"label": entity.get("label", ""),
-					"description": entity.get("description", ""),
+					"entity_name": entity_name,
+					"source_chunk_id": chunk_id,
+					"context": chunk_content[:200],
+					"item_name": item_name,
 				}
 				
 				if dense_vector is not None:
@@ -482,12 +523,12 @@ class KnowledgeGraphNode(BaseNode):
 				if sparse_vector is not None:
 					data["item_name_sparse_vector"] = sparse_vector
 				
-				data_list.append(data)
+				records.append(data)
 			
 			# 4. 插入集合(data可以是一条数据也可以数据组成的列表)
 			inserted_response = milvus_client.insert(
 				collection_name=collection_name,
-				data=data_list
+				data=records
 			)
 			
 			# 插入数据后，强制刷新数据到磁盘
@@ -496,10 +537,10 @@ class KnowledgeGraphNode(BaseNode):
 		except Exception as e:
 			self.logger.error(f"存储实体名称向量到Milvus数据库失败:{e}")
 	
-	def embedding_entity_name(self, entity_name: str):
+	def embedding_entity_name(self, entity_name: str, bge_m3_ef):
 		self.logger.info(f"当前处理的实体名称为: {entity_name}")
 		try:
-			bge_m3_ef = get_bge_m3_embedding_model()
+			
 			queries = [entity_name]
 			query_embeddings = bge_m3_ef.encode_queries(queries)
 			
@@ -542,17 +583,22 @@ class KnowledgeGraphNode(BaseNode):
 		
 		# 添加标量字段
 		schema.add_field(
-			field_name="name",
+			field_name="entity_name",
 			datatype=DataType.VARCHAR,
 			max_length=1024
 		)
 		schema.add_field(
-			field_name="label",
+			field_name="source_chunk_id",
 			datatype=DataType.VARCHAR,
 			max_length=1024
 		)
 		schema.add_field(
-			field_name="description",
+			field_name="context",
+			datatype=DataType.VARCHAR,
+			max_length=1024
+		)
+		schema.add_field(
+			field_name="item_name",
 			datatype=DataType.VARCHAR,
 			max_length=1024
 		)
