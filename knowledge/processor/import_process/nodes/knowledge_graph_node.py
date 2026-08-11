@@ -29,7 +29,8 @@ from pymilvus import MilvusClient, DataType
 
 from knowledge.processor.import_process.base import BaseNode, T
 from knowledge.processor.import_process.config import get_import_config, ImportConfig
-from knowledge.processor.import_process.exception import ValidationError, LLMError, MilvusError, EmbeddingError
+from knowledge.processor.import_process.exception import ValidationError, LLMError, MilvusError, EmbeddingError, \
+	Neo4jError
 from knowledge.processor.import_process.state import ImportGraphState
 from knowledge.prompts.import_prompt import KNOWLEDGE_GRAPH_SYSTEM_PROMPT
 from knowledge.utils.bge_m3_embedding_model import get_bge_m3_embedding_model
@@ -37,7 +38,7 @@ from knowledge.utils.llm_client import get_llm_client
 from knowledge.utils.milvus_client import get_milvus_client
 from knowledge.utils.neo4j_client import get_neo4j_client
 
-# 实体Label白名单
+# 实体类型白名单（SET）
 ALLOWED_ENTITY_LABEL_TYPES = {
 	"Device",
 	"Part",
@@ -48,7 +49,7 @@ ALLOWED_ENTITY_LABEL_TYPES = {
 	"Tool"
 }
 
-# 实体关系类型白名单
+# 实体关系类型白名单（SET）
 ALLOWED_RELATION_TYPES = {
 	"HAS_OPERATION",
 	"HAS_PART",
@@ -102,11 +103,15 @@ class KnowledgeGraphNode(BaseNode):
 		# 2. 构建日志记录
 		process_state = ProcessingState(total_chunks=len(validated_chunks))
 		
-		# 3. 清除已经存在数据
-		# 删除Milvus中存储实体名字的记录
-		# 删除neo4j的整个库下的所有节点和信息
 		milvus_client = get_milvus_client()
+		if milvus_client is None:
+			raise MilvusError(node_name=self.name, message="Milvus客户端连接失败")
+		
 		neo4j_client = get_neo4j_client()
+		if neo4j_client is None:
+			raise Neo4jError(node_name=self.name, message="Neo4j客户端连接失败")
+		
+		# 3. 清除（保证幂等性 防止出现重复创建）
 		self.clear_exist_data(milvus_client, neo4j_client, item_name, config)
 		
 		# 3. 批量处理遍历chunks【串行】TODO: 多线程版本
@@ -181,13 +186,11 @@ class KnowledgeGraphNode(BaseNode):
 		Returns:
 
 		"""
-		if not milvus_client:
-			raise MilvusError(node_name=self.name,message="Milvus 客户端连接不存在")
-		
 		collection_name = config.entity_name_collection
 		if not collection_name:
-			raise MilvusError(node_name=self.name,message=f"Milvus 集合{collection_name}不存在")
+			raise MilvusError(node_name=self.name, message=f"Milvus 集合{collection_name}不存在")
 		
+		# 删除Milvus中存储实体名字的记录
 		try:
 			if milvus_client.has_collection(collection_name):
 				milvus_client.delete(
@@ -196,7 +199,22 @@ class KnowledgeGraphNode(BaseNode):
 				)
 				self.logger.info(f"已清空所有商品名为{item_name}的实体节点")
 		except Exception as e:
-			raise MilvusError(node_name=self.name,message=f"Milvus删除集合失败:{e}")
+			raise MilvusError(node_name=self.name, message=f"Milvus删除集合失败:{e}")
+		
+		# 删除neo4j的所有item_name为item_name的实体和关系节点
+		try:
+			neo4j_client.execute_query(
+				query_="""
+				MERGE (n:ENTITY {item_name:$item_name})
+				DETACH DELETE n
+				""",
+				parameters_={
+					"item_name": item_name
+				},
+				database_=config.neo4j_database
+			)
+		except Exception as e:
+			raise Neo4jError(node_name=self.name, message=f"Neo4j删除{item_name}有关节点和关系失败:{e}")
 	
 	def process_all_chunks(
 			self,
@@ -218,7 +236,7 @@ class KnowledgeGraphNode(BaseNode):
 			except Exception as e:
 				process_state.failed_chunks += 1
 				process_state.errors.append(str(e))
-				self.logger.error(f"处理{chunk_id}图谱构建失败")
+				self.logger.error(f"处理{chunk_id}图谱构建失败:{e}")
 	
 	def process_single_chunk(self, chunk: Dict[str, Any], milvus_client: MilvusClient, neo4j_client: Driver):
 		chunk_id = chunk.get("chunk_id", "")
@@ -245,9 +263,12 @@ class KnowledgeGraphNode(BaseNode):
 		                 f"提取到 {len(relations)} 条关系")
 		
 		# 4. 将清洗后的实体名字写入至Milvus向量数据库【目的：用户提问时先从向量数据库中找到精确实体名称】
-		self.save_entity_names_to_milvus(entities, config, chunk)
+		self.save_entity_names_to_milvus(entities, config, chunk, milvus_client)
 		
 		# 5. 将清洗后的实体名字和关系写入到Neo4j图谱中 【目的：混合检索阶段可以查询到问题中的实体关联关系】
+		self.save_graph_data_to_neo4j(entities, relations, config, chunk, neo4j_client)
+		
+		# 6. 返回处理完成的节点数据
 		return entities, relations
 	
 	def extract_graph_with_retry(self, chunk: Dict[str, Any], config: ImportConfig):
@@ -454,7 +475,7 @@ class KnowledgeGraphNode(BaseNode):
 				tail_entity_name = tail_entity_name[:config.max_entity_name_length + 1]
 			
 			# 关系类型不在白名单 此时可以给默认关系
-			if relation_type not in ALLOWED_ENTITY_LABEL_TYPES:
+			if relation_type not in ALLOWED_RELATION_TYPES:
 				relation_type = DEFAULT_RELATION_TYPE
 			
 			# 悬空关系：一个关系的头尾节点的名称都不在cleaned_entity_names里面
@@ -473,37 +494,35 @@ class KnowledgeGraphNode(BaseNode):
 		
 		return cleaned_relations
 	
-	def save_entity_names_to_milvus(self, entities: List[Dict[str, Any]], config: ImportConfig, chunk: Dict[str, Any]):
+	def save_entity_names_to_milvus(self, entities: List[Dict[str, Any]], config: ImportConfig, chunk: Dict[str, Any],
+	                                milvus_client: MilvusClient):
 		"""
 		存储所有实体名称到Milvus向量数据库
 		Args:
 			entities:
 			config:
+			chunk:
+			milvus_client:
 
 		Returns:
 
 		"""
 		try:
-			# 1. client客户端创建
-			milvus_client = get_milvus_client(uri=config.milvus_url)
-			if milvus_client is None:
-				raise MilvusError(node_name=self.name, message="获取Milvus客户端失败")
-			
-			# 2. 构建Collection
+			# 1. 构建Collection
 			collection_name = config.entity_name_collection
 			if not milvus_client.has_collection(collection_name=collection_name):
 				self.create_entity_name_collection(milvus_client, collection_name)
 			
-			# 3. 获取BGE-M3本地向量模型
+			# 2. 获取BGE-M3本地向量模型
 			bge_m3_ef = get_bge_m3_embedding_model()
 			
-			# 4. 生成数据
+			# 3. 生成数据
 			records = []
 			chunk_content = chunk.get("content", "")
 			chunk_id = chunk.get("chunk_id", "")
 			item_name = chunk.get("item_name", "")
 			
-			# 5. 对entities进行去重
+			# 4. 对entities进行去重
 			unique_entity_names: Set[str] = {entity["name"] for entity in entities}
 			for entity_name in unique_entity_names:
 				# 1. 使用BGE-M3本地向量模型将所有实体名称转化为稀疏和稠密向量
@@ -518,20 +537,20 @@ class KnowledgeGraphNode(BaseNode):
 				}
 				
 				if dense_vector is not None:
-					data["item_name_dense_vector"] = dense_vector
+					data["entity_name_dense_vector"] = dense_vector
 				
 				if sparse_vector is not None:
-					data["item_name_sparse_vector"] = sparse_vector
+					data["entity_name_sparse_vector"] = sparse_vector
 				
 				records.append(data)
 			
-			# 4. 插入集合(data可以是一条数据也可以数据组成的列表)
+			# 5. 插入集合(data可以是一条数据也可以数据组成的列表)
 			inserted_response = milvus_client.insert(
 				collection_name=collection_name,
 				data=records
 			)
 			
-			# 插入数据后，强制刷新数据到磁盘
+			# 6. 插入数据后，强制刷新数据到磁盘
 			milvus_client.flush(collection_name=collection_name)
 			self.logger.info(f"实体名称向量插入到集合{collection_name}成功")
 		except Exception as e:
@@ -567,7 +586,7 @@ class KnowledgeGraphNode(BaseNode):
 			return dense_vector, sparse_vector
 		
 		except Exception as e:
-			raise EmbeddingError(f"实体名称{entity_name}嵌入失败: {e}")
+			raise EmbeddingError(node_name=self.name,message=f"实体名称{entity_name}嵌入失败: {e}")
 	
 	def create_entity_name_collection(self, milvus_client: MilvusClient, collection_name: str):
 		# 创建Schema
@@ -642,3 +661,130 @@ class KnowledgeGraphNode(BaseNode):
 		
 		self.logger.info(f"创建实体名称集合向量成功，集合名称：{collection_name}")
 		return collection
+	
+	def save_graph_data_to_neo4j(self, entities, relations, config: ImportConfig, chunk: Dict[str, Any],neo4j_driver):
+		"""
+		1. 新建Chunk节点 类型为Chunk 属性为chunk_id和item_name
+		2. 新建实体节点 类型为（通用类型）Entity和LLM返回的单独类型label 属性为：
+			- 实体名称
+			- 实体描述
+			- 源chunk的id
+			- item_name商品名
+		3. 新建实体和实体之间的关系（基于大模型返回）
+		
+		查询关系：
+		用户自然语言提问，从中提取到实体名称
+		拿着实体名称去向量数据库检索最相似实体名称，确定实体名称完全匹配，避免语义相近但是不相等的问题
+		拿着确定实体名称在图数据库进行检索，检索到对应的chunk块
+		基于chunk id去向量数据库找到最相似的chunk后返回
+		
+		Args:
+			entities:
+			relations:
+			config:
+			chunk:
+			neo4j_driver:
+
+		Returns:
+
+		"""
+		if not entities or not relations:
+			self.logger.error("存入Neo4j图数据库的实体或关系数据不存在")
+			return
+		
+		# 获取neo4j客户端
+		database = config.neo4j_database
+		chunk_id = chunk.get("chunk_id", ""),
+		item_name = chunk.get("item_name", "")
+		
+		# 新建chunk节点
+		neo4j_driver.execute_query(
+			query_="""
+			MERGE (c:CHUNK {chunk_id:$chunk_id,item_name:$item_name})
+			""",
+			parameters_={
+				"chunk_id": chunk_id,
+				"item_name": item_name
+			},
+			database_=database
+		)
+		
+		for entity in entities:
+			name = entity.get("name", "")
+			label = entity.get("label", "")
+			description = entity.get("description", "")
+			
+			# 新建实体节点
+			neo4j_driver.execute_query(
+				# python中f-string原本会将{}中的内容保留用于嵌入遍历，因此{{}}就是在字符串中保留一个单花括号{}
+				query_=f"""
+				MERGE (n:ENTITY {{name:$name,item_name:$item_name}})
+				ON CREATE SET
+					n.source_chunk_id = $chunk_id,
+					n.description = $description
+				ON MATCH SET
+					n.description = CASE
+						WHEN $description <> "" THEN $description
+						ELSE coalesce(n.description,"")
+					END
+				SET n:`{label}`
+				""",
+				parameters_={
+					"name": name,
+					"description": description,
+					"chunk_id": chunk_id,
+					"item_name": item_name
+				},
+				database_=database
+			)
+			
+			# 新建当前ENTITY节点和CHUNK节点的关系 关系类型：MENTION——IN
+			neo4j_driver.execute_query(
+				query_="""
+				MATCH (c:CHUNK {chunk_id:$chunk_id,item_name:$item_name})
+				MATCH (n:ENTITY {name:$name,item_name:$item_name})
+				MERGE (n)-[:MENTIONED_IN]->(c)
+				""",
+				parameters_={
+					"name": name,
+					"chunk_id": chunk_id,
+					"item_name": item_name
+				},
+				database_=database
+			)
+		
+		# 新建实体ENTITY节点与实体ENTITY节点之间关联关系
+		for relation in relations:
+			head_name = relation.get("head", "")
+			tail_name = relation.get("tail", "")
+			relation_type = relation.get("type", "")
+			neo4j_driver.execute_query(
+				query_=f"""
+				MATCH (head:ENTITY {{name:$head_name,item_name:$item_name}})
+				MATCH (tail:ENTITY {{name:$tail_name,item_name:$item_name}})
+				MERGE (head)-[:{relation_type}]->(tail)
+				""",
+				parameters_={
+					"head_name": head_name,
+					"tail_name": tail_name,
+					"item_name":item_name
+				},
+				database_=database
+			)
+
+
+if __name__ == "__main__":
+	knowledgeGraphNode = KnowledgeGraphNode()
+	result = knowledgeGraphNode.process({
+		"chunks": [
+			{
+				"content": "## 电池测试\n\n\n1. 将黑色表笔插入负极COM端口，红色表笔插入正极V 端口。\n\n2. 使用功能选择键，选择1.5V 或 9V 电池档位。\n\n3. 将红色表笔接触电池正极，将黑色表笔接触电池负极。\n\n4. 在显示屏上读取数值。\n\n\n\n- 【9V 电池:】：良好为>8.2V，较弱为7.2 至 8.2V，坏的为<7.2V。\n- 【1.5V 电池:】：良好为>1.35V，较弱为1.22 至 1.35V，坏的为<1.22V。",
+				"parent_title": "万用表RS-12的使用",
+				"file_title": "万用表RS-12的使用",
+				"item_name": "RS-12 数字万用表",
+				"chunk_id": "468082957058058874"
+			}
+		],
+		"item_name": "RS-12 数字万用表"
+	})
+	print(result)
