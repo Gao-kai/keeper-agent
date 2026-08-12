@@ -20,6 +20,8 @@ TODO: 不一定需要把所有实体都提取出来 我们的目的是找到原�
 import json
 import re
 import time
+from asyncio import as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple, Set
 
@@ -115,7 +117,8 @@ class KnowledgeGraphNode(BaseNode):
 		self.clear_exist_data(milvus_client, neo4j_client, item_name, config)
 		
 		# 3. 批量处理遍历chunks【串行】TODO: 多线程版本
-		self.process_all_chunks(validated_chunks, milvus_client, neo4j_client, process_state)
+		self.process_concurrently(validated_chunks, milvus_client, neo4j_client, process_state)
+		# self.process_all_chunks(validated_chunks, milvus_client, neo4j_client, process_state)
 		
 		return state
 	
@@ -715,6 +718,7 @@ class KnowledgeGraphNode(BaseNode):
 			description = entity.get("description", "")
 			
 			# 新建实体节点
+			# 无论节点是新建还是已存在，语句最后都会执行 SET n:{label}``
 			neo4j_driver.execute_query(
 				# python中f-string原本会将{}中的内容保留用于嵌入遍历，因此{{}}就是在字符串中保留一个单花括号{}
 				query_=f"""
@@ -771,6 +775,73 @@ class KnowledgeGraphNode(BaseNode):
 				},
 				database_=database
 			)
+	
+	def process_concurrently(self, validated_chunks, milvus_client, neo4j_client, process_state):
+		"""
+		
+		Args:
+			validated_chunks:
+			milvus_client:
+			neo4j_client:
+			process_state:
+
+		Returns:
+		
+		CPU：一台电脑物理上只有一个CPU插槽
+		8核：一个CPU可以独立处理的物理核心，表示在同一时间点上，你的电脑可以同时处理8个不同的任务
+		16线程：一个线程表示一个独立的工作通道，默认一个核心对应一个线程，但是现代CPU超线程技术可以让一个核心有2个逻辑线程
+		
+		开启多线程的目的：将CPU的性能利用最大化，在同一时间尽可能的让所有线程工作；但是会提高上下文切换的时间
+		
+		并行处理:  本质是在同一时间点有多个任务在多个独立的物理核心上执行，比如CPU密集任务如视频渲染、AI循环等
+		并发处理： 本质是在同一时间点只有一个任务在单个独立的核心上执行，只是该核心不断的调度其他线程来切换执行，比如I/O密集型任务
+				  在A时间点在进行文件读取，读取文件需要时间，这段空闲出来的时间去发起网络请求
+		
+		Python 的 as_completed：
+		底层依赖的是真正的多线程（或多进程）。
+		后台线程是真正并行运行的，当某个线程完成任务时，它会通过内部的线程安全队列（Queue）向主线程发送信号。
+		主线程的 for 循环通过阻塞等待这个队列，实现了“谁先完成谁先被处理”。
+		
+		JavaScript 的异步：
+		JS 是单线程的，完全依赖事件循环（Event Loop）。
+		所有的异步操作（如网络请求、定时器）都被包装成 Promise，并扔进任务队列中。
+		JS 没有真正的多线程在后台并发执行，因此不存在一个“后台监控线程”来实时把完成的结果推给主循环。
+		"""
+		with ThreadPoolExecutor(max_workers=4) as executor:
+			future_to_chunk_id = {}
+			
+			# 收集任务
+			for index,chunk in enumerate(validated_chunks):
+				chunk_id = chunk.get("chunk_id","")
+				task = self.process_single_chunk
+				future = executor.submit(
+					task,
+					chunk,
+					milvus_client,
+					neo4j_client
+				)
+				future_to_chunk_id[future] = (index,chunk_id)
+			
+			# 收集结果 按照任务实际完成的顺序（谁先做完谁先返回），而不是按照你提交任务的顺序，来返回结果
+			# 将futures列表传给s_completed()它返回的是一个迭代器（Iterator）迭代器内部其实有一个隐藏的队列
+			# 后台的线程每完成一个任务，就会把对应的future扔进这个队列。
+			# for 循环在同步地、一个一个地从队列里拿结果。
+			# 如果队列里有结果，for 循环立刻拿到并执行循环体。
+			# 如果队列是空的（后台任务还没做完），for 循环就会在这里“卡住”（阻塞等待），直到下一个任务完成并进入队列。
+			# 所以，for 循环的结束，就意味着 as_completed() 已经把后台所有的任务都“吐”出来了。
+			for future in as_completed(future_to_chunk_id):
+				index,chunk_id = future_to_chunk_id[future]
+				try:
+					entities, relations = future.result()
+					process_state.processed_chunks += 1
+					process_state.total_entities += len(entities)
+					process_state.total_relations += len(relations)
+					self.logger.info(f"成功处理{chunk_id}图谱构建")
+				except Exception as e:
+					process_state.failed_chunks += 1
+					process_state.errors.append(str(e))
+					self.logger.error(f"处理{chunk_id}图谱构建失败:{e}")
+				
 
 
 if __name__ == "__main__":
@@ -787,4 +858,5 @@ if __name__ == "__main__":
 		],
 		"item_name": "RS-12 数字万用表"
 	})
+	as_completed()
 	print(result)
