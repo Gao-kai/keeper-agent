@@ -20,8 +20,7 @@ TODO: 不一定需要把所有实体都提取出来 我们的目的是找到原�
 import json
 import re
 import time
-from asyncio import as_completed
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor,as_completed
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple, Set
 
@@ -94,7 +93,7 @@ class ProcessingState:
 
 
 class KnowledgeGraphNode(BaseNode):
-	name = "extract_entity_node"
+	name = "knowledge_graph_node"
 	
 	def process(self, state: ImportGraphState) -> ImportGraphState:
 		config = get_import_config()
@@ -697,7 +696,7 @@ class KnowledgeGraphNode(BaseNode):
 		
 		# 获取neo4j客户端
 		database = config.neo4j_database
-		chunk_id = chunk.get("chunk_id", ""),
+		chunk_id = chunk.get("chunk_id", "")
 		item_name = chunk.get("item_name", "")
 		
 		# 新建chunk节点
