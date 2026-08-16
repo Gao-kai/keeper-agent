@@ -75,15 +75,15 @@ def create_import_graph() -> CompiledStateGraph:
     # 编译
     return graph_buildr.compile()
 
-def run_import_graph():
+def run_import_graph(import_file_path:str,file_dir:str):
     # 1. 获取图的示意图
     import_graph = create_import_graph()
     print(f"流程图示意图\n")
     import_graph.get_graph().print_ascii()
     
     # 2. 构建初始状态
-    import_file_path = "/Users/artest/Desktop/shopkeeper/data/doc/HUAWEI MateStation S 12代酷睿版 用户指南-(PUC,Windows11_02,zh-cn).pdf"
-    file_dir = "/Users/artest/Desktop/shopkeeper/output"
+    import_file_path = import_file_path or "/Users/artest/Desktop/shopkeeper/data/doc/HUAWEI MateStation S 12代酷睿版 用户指南-(PUC,Windows11_02,zh-cn).pdf"
+    file_dir = file_dir or "/Users/artest/Desktop/shopkeeper/output"
     init_state = create_default_state(**{
         "import_file_path": import_file_path,
         "file_dir": file_dir

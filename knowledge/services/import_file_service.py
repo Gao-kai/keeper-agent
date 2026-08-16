@@ -10,10 +10,17 @@ from fastapi import UploadFile
 
 from knowledge.processor.import_process.config import get_import_config
 from knowledge.processor.import_process.exception import FileProcessingError
+from knowledge.processor.import_process.main_graph import create_import_graph
+from knowledge.processor.import_process.state import create_default_state
+from knowledge.processor.import_process.main_graph import create_import_graph
+from knowledge.processor.import_process.state import create_default_state
 from knowledge.services.task_service import TaskService
 from knowledge.utils.minio_client import get_minio_client
-from knowledge.utils.project_path import get_local_cache_dir_name
+from knowledge.utils.path_utils import get_local_cache_dir_name
 from dotenv import load_dotenv
+
+from knowledge.utils.task_status import TASK_STATUS_PROCESSING, TASK_STATUS_COMPLETED
+
 load_dotenv(override=True)
 
 class ImportFileService:
@@ -56,6 +63,32 @@ class ImportFileService:
 		# 6. 返回参数
 		return task_id,import_file_path,file_dir
 	
+	def run_import_graph(self,import_file_path:str, file_dir:str, task_id:str):
+		# 更新当前任务状态为处理中
+		self.task_service.update_task_status(task_id,TASK_STATUS_PROCESSING)
+		
+		# 获取图Graph
+		import_graph = create_import_graph()
+		print(f"流程图示意图\n")
+		import_graph.get_graph().print_ascii()
+		
+		# 构建初始状态
+		init_state = create_default_state(**{
+			"task_id": task_id,
+			"import_file_path": import_file_path,
+			"file_dir": file_dir
+		})
+		
+		# 执行调用返回图更新后最新的state
+		final_state = None
+		for event in import_graph.stream(init_state):  # type: ignore
+			for node_name, state in event.items():
+				print(f"✅✅✅ 当前执行节点{node_name} ✅✅✅")
+				final_state = state
+		# 更新当前任务状态为完成
+		self.task_service.update_task_status(task_id,TASK_STATUS_COMPLETED)
+	
+	# print(f"流程执行完成: {json.dumps(final_state, ensure_ascii=False, indent=4)}")
 	
 	@staticmethod
 	def save_file_to_local(file_dir, file: UploadFile):
