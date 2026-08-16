@@ -857,5 +857,4 @@ if __name__ == "__main__":
 		],
 		"item_name": "RS-12 数字万用表"
 	})
-	as_completed()
 	print(result)

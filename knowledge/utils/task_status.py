@@ -81,7 +81,7 @@ def get_running_task_list(task_id: str) -> List[str]:
 	return [to_zh_cn(n) for n in task_running_list.get(task_id, [])]
 
 
-def get_done_task_list(task_id: str) -> List[str]:
+def get_completed_task_list(task_id: str) -> List[str]:
 	# 1. 获取指定任务已完成的节点列表，并通过列表推导式统一转换为中文展示名返回
 	return [to_zh_cn(n) for n in task_completed_list.get(task_id, [])]
 
