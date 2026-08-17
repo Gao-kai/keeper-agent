@@ -8,11 +8,66 @@
   }
 
   html {
-    color-scheme: dark;
+    color-scheme: light;
   }
 
   body {
-    @apply bg-background text-foreground antialiased;
+    @apply text-foreground antialiased;
+    /* 背景透明，由 body::before 提供米色纸张网格背景 */
+    background-color: transparent;
     font-family: "PingFang SC", "Inter", system-ui, sans-serif;
+  }
+
+  /*
+   * pi.dev 同款纸张网格背景（亮色主题 body::before）
+   * 米色纸底 + 细/粗双层网格线 + 交叉点打孔圆点
+   */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: -8rem;
+    z-index: -1; /* 置于内容之下，避免遮挡文字 */
+    pointer-events: none;
+
+    --grid-gap: 4px;
+    --paper-bg: #ebe7e4;
+
+    background-color: #ebe7e4;
+    background-image:
+      linear-gradient(#252f3d08 0 1px, transparent 1px 4px),
+      linear-gradient(to right, #252f3d08 0 1px, transparent 1px 4px),
+      linear-gradient(#252f3d12 0 1px, transparent 1px 20px),
+      linear-gradient(to right, #252f3d12 0 1px, transparent 1px 20px),
+      radial-gradient(circle at center, transparent 2px, #ebe7e4 2px 100%),
+      linear-gradient(#252f3d1d 0 1px, transparent 1px 20px),
+      linear-gradient(to right, #252f3d1d 0 1px, transparent 1px 20px);
+    background-size:
+      4px 4px,
+      4px 4px,
+      20px 20px,
+      20px 20px,
+      20px 20px,
+      20px 20px,
+      20px 20px;
+    background-position:
+      0 0, 0 0, 0 0, 0 0,
+      -10px -10px,
+      0 0, 0 0;
+  }
+
+  /* 进度面板内部滚动条样式 */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: #4b607c3d;
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: #4b607c59;
   }
 }

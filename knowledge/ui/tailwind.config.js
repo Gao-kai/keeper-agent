@@ -10,20 +10,26 @@ export default {
   theme: {
     extend: {
       colors: {
-        // 深色科技感基础色板（后续功能开发时使用）
-        background: "#0B0E14",
-        surface: "#11151D",
-        surfaceLight: "#1A1F2E",
+        // 明亮暖色调（参考 pi.dev 亮色主题：moonstone / parchment 色系）
+        background: "#ebe7e4",        // moonstone 页面底色
+        backgroundDeep: "#dacbc2",    // parchment 深一档暖色
+        surface: "#f4f2f0",           // panel 卡片背景
+        surfaceLight: "#eef1f3",      // panel-soft 浅色区块
         primary: {
-          DEFAULT: "#6366F1",
-          light: "#8B5CF6",
-          dark: "#4F46E5",
+          DEFAULT: "#4b607c",         // thread blue 主强调色
+          light: "#6a9fcc",           // accent blue 高亮
+          dark: "#394352",            // 按钮 hover 加深
         },
-        foreground: "#F1F5F9",
-        muted: "#94A3B8",
+        foreground: "#252f3d",        // 深蓝灰主文字
+        muted: "#5c5752",             // 暖灰次要文字
+        success: "#5db87a",
+        warning: "#e8993a",
+        error: "#e8704f",
       },
       fontFamily: {
         sans: ['"PingFang SC"', "Inter", "system-ui", "sans-serif"],
+        // 衬线字体用于页面主标题，增加质感
+        serif: ['"Source Han Serif SC"', '"Noto Serif SC"', "Georgia", '"Times New Roman"', "serif"],
       },
       borderRadius: {
         lg: "var(--radius)",

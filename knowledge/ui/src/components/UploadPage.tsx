@@ -183,10 +183,10 @@ export default function UploadPage() {
         : "处理中";
 
   return (
-    <div className="flex min-h-screen items-center justify-center p-6 lg:p-10">
+    <div className="flex min-h-screen items-center justify-center px-6 pt-4 pb-6 lg:px-10 lg:pt-6 lg:pb-10">
       <main className="w-full max-w-6xl">
         <header className="mb-10 text-center">
-          <h1 className="font-serif text-5xl font-semibold tracking-wide text-foreground lg:text-6xl">
+          <h1 className="-mt-8 font-serif text-5xl font-semibold tracking-wide text-foreground lg:-mt-12 lg:text-6xl">
             掌柜智库
           </h1>
           <p className="mt-3 text-xl text-muted">
