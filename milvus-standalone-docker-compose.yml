@@ -1,6 +1,7 @@
 version: '3.5'
 
 services:
+  # ==================== milvus服务 ====================
   etcd:
     container_name: shopkeeper-milvus-etcd
     image: quay.io/coreos/etcd:v3.5.25
@@ -13,7 +14,7 @@ services:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
     command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
-      test: ["CMD", "etcdctl", "endpoint", "health"]
+      test: [ "CMD", "etcdctl", "endpoint", "health" ]
       interval: 30s
       timeout: 20s
       retries: 3
@@ -31,7 +32,7 @@ services:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
     command: minio server /minio_data --console-address ":9001"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
       interval: 30s
       timeout: 20s
       retries: 3
@@ -39,9 +40,9 @@ services:
   standalone:
     container_name: shopkeeper-milvus-standalone
     image: milvusdb/milvus:v2.6.11
-    command: ["milvus", "run", "standalone"]
+    command: [ "milvus", "run", "standalone" ]
     security_opt:
-    - seccomp:unconfined
+      - seccomp:unconfined
     environment:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
@@ -49,7 +50,7 @@ services:
     volumes:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      test: [ "CMD", "curl", "-f", "http://localhost:9091/healthz" ]
       interval: 30s
       start_period: 90s
       timeout: 20s
@@ -91,7 +92,26 @@ services:
       - "7687:7687"
     restart: always
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7474"]
+      test: [ "CMD", "curl", "-f", "http://localhost:7474" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==================== MongoDB ====================
+  mongodb:
+    container_name: mongo_db
+    image: mongo:7.0
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/mongo-data/logs:/logs
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/mongo-data/data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: booker
+      MONGO_INITDB_ROOT_PASSWORD: Manulife
+    healthcheck:
+      test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')" ]
       interval: 30s
       timeout: 10s
       retries: 3
