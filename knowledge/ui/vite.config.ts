@@ -9,10 +9,12 @@ export default defineConfig({
     port: 5173,
     allowedHosts: true,
     // 开发环境将 /api 请求代理到本地 FastAPI 后端
+    // 后端路由无 /api 前缀，这里重写路径去掉前缀
     proxy: {
       '/api': {
         target: 'http://localhost:8000',
         changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ''),
       },
     },
   },

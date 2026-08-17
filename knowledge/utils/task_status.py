@@ -35,7 +35,7 @@ _NODE_NAME_TO_CN: Dict[str, str] = {
 
 
 def to_zh_cn(node_name: str) -> str:
-	return _NODE_NAME_TO_CN.get("node_name", node_name)
+	return _NODE_NAME_TO_CN.get(node_name, node_name)
 
 
 def add_running_task(task_id: str, node_name: str):
@@ -48,7 +48,8 @@ def add_running_task(task_id: str, node_name: str):
 	Returns:
 
 	"""
-	current_running_list = task_running_list.get(task_id)
+	# 下标访问：defaultdict 在 key 不存在时自动创建空列表
+	current_running_list = task_running_list[task_id]
 	# 避免重复添加
 	if node_name not in current_running_list:
 		current_running_list.append(node_name)
@@ -65,11 +66,11 @@ def add_completed_task(task_id: str, node_name: str):
 
 	"""
 	# 如果当前节点在运行过程 移除
-	current_running_list = task_running_list.get(task_id)
+	current_running_list = task_running_list[task_id]
 	if node_name in current_running_list:
 		current_running_list.remove(node_name)
 	
-	current_completed_list = task_running_list.get(task_id)
+	current_completed_list = task_completed_list[task_id]
 	
 	# 避免重复添加
 	if node_name not in current_completed_list:

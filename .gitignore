@@ -58,4 +58,4 @@ build/
 data/**/*
 output/**/*
 /questions/Neo4j
-/cache/**/*
+*/cache/**/*
