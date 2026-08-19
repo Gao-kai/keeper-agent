@@ -23,7 +23,6 @@ from typing import Optional, TypeVar
 
 from knowledge.processor.import_process.config import ImportConfig, get_import_config
 from knowledge.processor.import_process.exception import ImportProcessError
-from knowledge.processor.import_process.state import ImportGraphState
 from knowledge.utils.task_status import add_running_task, add_completed_task
 
 T = TypeVar("T")  # 泛型状态类型
