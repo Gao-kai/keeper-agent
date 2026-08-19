@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List
 
 from pymilvus.model.hybrid import BGEM3EmbeddingFunction
 from dotenv import load_dotenv
@@ -12,7 +12,22 @@ load_dotenv(override=True)
 bge_m3_ef: Optional[BGEM3EmbeddingFunction] = None
 
 
-def get_bge_m3_embedding_model():
+def get_bge_m3_embedding_model() -> Optional[BGEM3EmbeddingFunction]:
+	"""
+	获取 BGE-M3 混合嵌入模型（单例模式）。
+
+	从环境变量读取模型配置并初始化 BGEM3EmbeddingFunction 实例，
+	首次调用时创建，后续调用直接复用已创建的实例，避免重复加载模型。
+
+	环境变量:
+		BGE_M3_PATH: 模型路径或模型名称，默认 "BAAI--bge-m3"
+		BGE_DEVICE: 运行设备，如 'cpu' 或 'cuda:0'，默认 "cpu"
+		BGE_FP16: 是否启用半精度（fp16），默认 False
+
+	Returns:
+		Optional[BGEM3EmbeddingFunction]: 初始化好的 BGE-M3 嵌入模型实例；
+		初始化失败时记录错误日志并返回 None。
+	"""
 	try:
 		global bge_m3_ef
 		
@@ -38,36 +53,52 @@ def get_bge_m3_embedding_model():
 		logger.error(f"初始化BGE-M3向量嵌入模型失败: {e}")
 
 
-if __name__ == "__main__":
-	bge_m3_ef = get_bge_m3_embedding_model()
-	queries = ["我喜欢苹果手机"]
-	query_embeddings = bge_m3_ef.encode_queries(queries)
-	print(f"query_embeddings:{query_embeddings}")
-	print(f"稠密向量：{query_embeddings.get("dense", [])[0].tolist()}")
+def generate_hybrid_embeddings(
+		embedding_model: BGEM3EmbeddingFunction,
+		embedding_docs: List[str]
+) -> dict:
+	"""
+	为文档列表生成混合嵌入向量（稠密 + 稀疏）。
+
+	使用 BGE-M3 模型对每个文档进行编码，并将结果解析为
+	稠密向量（dense）与稀疏向量（sparse）两类，
+	便于后续用于混合检索（Hybrid Search）。
+
+	Args:
+		embedding_model: BGEM3EmbeddingFunction 嵌入模型实例
+		embedding_docs: 待编码的文档文本列表
+
+	Returns:
+		dict: 包含 "dense"（稠密向量列表）和 "sparse"（稀疏向量字典列表，
+		格式为 {token_id: weight}）两个键的混合嵌入结果
+	"""
 	
-	# 获取稀疏向量CSR
-	sparse_matrix = query_embeddings["sparse"]
+	doc_embeddings = embedding_model.encode_documents(embedding_docs)
+	hybrid_embeddings_result = {
+		"dense": [],
+		"sparse": []
+	}
 	
-	sparse_vectors = []
-	
-	# 遍历每一句话
-	for i in range(len(queries)):
+	# 解析稀疏和稠密向量
+	for index, chunk in enumerate(embedding_docs):
+		# 获取稠密向量dense
+		dense_vector = doc_embeddings['dense'][index].tolist()
+		
+		# 获取稀疏向量CSR
+		sparse_matrix = doc_embeddings["sparse"]
+		
 		# 获取第 i 句话非零元素的起止索引
-		start_idx = sparse_matrix.indptr[i]
-		end_idx = sparse_matrix.indptr[i + 1]
+		start_idx = sparse_matrix.indptr[index]
+		end_idx = sparse_matrix.indptr[index + 1]
 		
 		# 提取对应的 Token IDs 和 权重
 		token_ids = sparse_matrix.indices[start_idx:end_idx].tolist()
 		weights = sparse_matrix.data[start_idx:end_idx].tolist()
 		
-		print(f"稀疏向量的非零元素的索引列表：{start_idx}-{end_idx}")
-		
-		print(f"稀疏向量的非零元素的权重列表：{weights}")
-		
-		print(f"稀疏向量的非零元素的TokenID列表：{token_ids}")
-		
-		# 打包成字典
+		# 打包成字典 {tokenId:weight}
 		sparse_vector = dict(zip(token_ids, weights))
-		sparse_vectors.append(sparse_vector)
+		
+		hybrid_embeddings_result["dense"].append(dense_vector)
+		hybrid_embeddings_result["sparse"].append(sparse_vector)
 	
-	print(f"稀疏向量列表：{sparse_vectors}")
+	return hybrid_embeddings_result
