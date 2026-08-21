@@ -1,10 +1,9 @@
-import json
 from typing import Literal
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.state import CompiledStateGraph
 
-from knowledge.processor.import_process.log_config import setup_logging
+from knowledge.utils.log_config import setup_logging
 from knowledge.processor.import_process.nodes.chunk_embedding_node import ChunkEmbeddingNode
 from knowledge.processor.import_process.nodes.document_split_node import DocumentSplitNode
 from knowledge.processor.import_process.nodes.entry_node import EntryNode

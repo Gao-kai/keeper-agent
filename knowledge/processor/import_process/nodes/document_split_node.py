@@ -16,10 +16,10 @@ import os
 import re
 from pathlib import Path
 from typing import List, Dict, Any
-from knowledge.processor.import_process.base import BaseNode, T
+from knowledge.processor.import_process.base import BaseNode
 from knowledge.processor.import_process.config import get_import_config
 from knowledge.processor.import_process.exception import ConfigurationError
-from knowledge.processor.import_process.log_config import setup_logging
+from knowledge.utils.log_config import setup_logging
 from knowledge.processor.import_process.state import ImportGraphState
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 

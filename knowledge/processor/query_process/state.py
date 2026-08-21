@@ -9,7 +9,7 @@ from typing import TypedDict, List
 import copy
 
 
-class QueryGraphState(TypedDict):
+class QueryGraphState(TypedDict,total=False):
     """查询流程图状态。
 
     包含整个查询流程中传递的所有数据。

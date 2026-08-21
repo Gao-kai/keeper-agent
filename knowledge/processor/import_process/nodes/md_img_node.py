@@ -18,14 +18,13 @@ import re
 import time
 from collections import deque
 from pathlib import Path
-from pyexpat.errors import messages
 from typing import Tuple, List, Deque, Dict
 from minio import Minio
 
 from knowledge.processor.import_process.base import BaseNode, T
 from knowledge.processor.import_process.config import get_import_config, ImportConfig
 from knowledge.processor.import_process.exception import ValidationError, FileProcessingError
-from knowledge.processor.import_process.log_config import setup_logging
+from knowledge.utils.log_config import setup_logging
 from knowledge.processor.import_process.state import ImportGraphState
 from knowledge.utils.minio_client import get_minio_client
 

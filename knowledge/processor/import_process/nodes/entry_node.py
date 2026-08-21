@@ -17,7 +17,7 @@ import json
 from knowledge.processor.import_process.base import BaseNode, T
 from knowledge.processor.import_process.exception import ValidationError
 from pathlib import Path
-from knowledge.processor.import_process.log_config import setup_logging
+from knowledge.utils.log_config import setup_logging
 
 
 class EntryNode(BaseNode):

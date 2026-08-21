@@ -39,9 +39,9 @@ import json
 from pathlib import Path
 from typing import Tuple
 
-from knowledge.processor.import_process.base import BaseNode, T
+from knowledge.processor.import_process.base import BaseNode
 from knowledge.processor.import_process.exception import FileProcessingError, PdfConversionError
-from knowledge.processor.import_process.log_config import setup_logging
+from knowledge.utils.log_config import setup_logging
 from knowledge.processor.import_process.state import ImportGraphState
 
 
