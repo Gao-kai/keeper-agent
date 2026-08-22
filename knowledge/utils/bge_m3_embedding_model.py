@@ -51,6 +51,7 @@ def get_bge_m3_embedding_model() -> Optional[BGEM3EmbeddingFunction]:
 		return bge_m3_ef
 	except Exception as e:
 		logger.error(f"初始化BGE-M3向量嵌入模型失败: {e}")
+		return  None
 
 
 def generate_hybrid_embeddings(

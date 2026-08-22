@@ -63,6 +63,8 @@ def get_milvus_client(uri: str = "") -> Optional[MilvusClient]:
 def create_hybrid_search_request(
 		dense_vector,
 		sparse_vector,
+		dense_req_field_name="dense_vector",
+		sparse_req_field_name="sparse_vector",
 		dense_params=None,
 		sparse_params=None,
 		expr=None,
@@ -95,7 +97,7 @@ def create_hybrid_search_request(
 	# 稠密向量检索器
 	dense_req = AnnSearchRequest(
 		data=[dense_vector],
-		anns_field="dense_vector",
+		anns_field=dense_req_field_name,
 		param=dense_params,
 		expr=expr,
 		limit=limit
@@ -104,7 +106,7 @@ def create_hybrid_search_request(
 	# 稀疏向量检索器
 	sparse_req = AnnSearchRequest(
 		data=[sparse_vector],
-		anns_field="sparse_vector",
+		anns_field=sparse_req_field_name,
 		param=sparse_params,
 		expr=expr,
 		limit=limit
