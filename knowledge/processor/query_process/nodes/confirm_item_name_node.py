@@ -21,6 +21,7 @@ logging.basicConfig(level=logging.INFO)
 MAX_OPTION_SIZE = 3
 HIGH_RELATED_SCORE = 0.7
 MIDDLE_RELATED_SCORE = 0.6
+MAX_SCORE_GAP = 0.15
 
 
 class ConfirmItemNameNode(BaseNode):
@@ -53,23 +54,25 @@ class ConfirmItemNameNode(BaseNode):
 		extracted_item_names = extract_result.get("item_names")
 		rewritten_query = extract_result.get("rewritten_query")
 		
+		# 2.1 如果LLM提取到了商品名称
 		if extracted_item_names:
-			confirmed_item_names = []
-			optional_item_names = []
 			
 			# 3. 基于查询到的item_names分别去向量数据库查询
 			search_result = self.vector_search(extracted_item_names)
 			
 			# 4. 基于RAG压测评估得出的相似度距离评分过滤出交付给下游最可能相关的商品名或供用户选择商品名
-			confirmed_item_names, optional_item_names = self.filter_item_name_by_score_limit(search_result)
+			confirmed_item_names, optional_item_names, confirmed_items = self.filter_item_name_by_score_limit(
+				search_result)
+			
+			# 5. 即使已经加入到confirmed_item_names但是将得分差异太大的过滤掉
+			confirmed_item_names = self.filter_item_name_by_score_gap(confirmed_items)
 		
-			# 5. 差异过滤
-			self.filter_item_name_by_score_gap(confirmed_item_names,search_result)
+		# 2.2 如果LLM没有提取到商品名称
 		else:
 			confirmed_item_names = []
 			optional_item_names = []
 		
-		# 5， 决定state是继续还是i结束
+		# 5， 决定state是继续还是结束
 		self.decide(state, extracted_item_names, confirmed_item_names, optional_item_names, rewritten_query)
 		
 		return state
@@ -192,10 +195,14 @@ class ConfirmItemNameNode(BaseNode):
 		Returns:
 
 		"""
+		# 确认成功：设置 item_names 和 rewritten_query
+		# 不返回Answer给用户 走四路召回
 		if confirmed_item_names and isinstance(confirmed_item_names, List):
 			state["item_names"] = confirmed_item_names
 			state["rewritten_query"] = rewritten_query
 		elif optional_item_names and isinstance(optional_item_names, List):
+			# 有候选：设置 answer 为反问文案
+			# 返回Answer给用户 走直接返回
 			state["answer"] = f"""
 			我不能确定您所说的具体是哪一款产品。
 			您指的是不是下面这些产品?
@@ -203,10 +210,12 @@ class ConfirmItemNameNode(BaseNode):
 			如果是请告诉我具体的产品名称！
 			"""
 		else:
+			# 直接返回 有Answer
 			state['answer'] = "抱歉，我无法识别您咨询的具体产品名称，请提供更加准确的产品名称或型号。"
 	
 	@staticmethod
-	def filter_item_name_by_score_limit(search_result: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
+	def filter_item_name_by_score_limit(search_result: List[Dict[str, Any]]) -> Tuple[
+		List[str], List[str], List[Dict[str, Any]]]:
 		"""
 		基于向量数据库检索到的商品名称，配合评分阈值来将商品名放入对应的confirmed或options数组中
 		
@@ -254,6 +263,7 @@ class ConfirmItemNameNode(BaseNode):
 		"""
 		confirmed_item_names = []
 		optional_item_names = []
+		confirmed_items = []  # 为了下一步得分差异过大的过滤
 		
 		for index, item in enumerate(search_result):
 			# 获取从Milvus向量数据库检索到的和LLM识别出的商品名最匹配的matches列表
@@ -283,11 +293,13 @@ class ConfirmItemNameNode(BaseNode):
 					picked = accurate_item["item_name"]
 					if picked not in confirmed_item_names:
 						confirmed_item_names.append(picked)
+						confirmed_items.append(accurate_item)
 				elif len(high_related_item_names) == 1:
 					# 场景2: 得分大于confirm阈值的商品只有一个 那就认为它是准确的
-					picked = high_related_item_names[0]
+					picked = high_related_item_names[0]['item_name']
 					if picked not in confirmed_item_names:
 						confirmed_item_names.append(picked)
+						confirmed_items.append(high_related_item_names[0])
 				else:
 					# 场景3:  得分大于confirm阈值的商品有多个 那么选出前Max个加入到options中 让用户选择
 					for high_related_item_name in high_related_item_names[:MAX_OPTION_SIZE]:
@@ -306,18 +318,44 @@ class ConfirmItemNameNode(BaseNode):
 						if picked not in optional_item_names and picked not in confirmed_item_names:
 							optional_item_names.append(picked)
 		
-		return confirmed_item_names, optional_item_names[:MAX_OPTION_SIZE]
+		return confirmed_item_names, optional_item_names[:MAX_OPTION_SIZE], confirmed_items
 	
-	def filter_item_name_by_score_gap(self, confirmed_item_names, search_result):
+	@staticmethod
+	def filter_item_name_by_score_gap(confirmed_items: List[Dict[str, Any]]) -> List[str]:
 		"""
+		假设有多个item刚好都进入到confirmed_item_names数组中
+		但是可能是下面这种情况：
+		[
+			{"item_name": "DT-9205A", "score": 0.95},
+            {"item_name": "DT-9205B", "score": 0.92},
+            {"item_name": "DT-9202",  "score": 0.71},
+		]
+		
+		可以看出最后一个虽然也大于0.7阈值，但是相对于前面两个其得分的差距过大
+		因此一旦超出最大得分的差距MAX_SCORE_GAP
+		还需要将这种item进行过滤
 		
 		Args:
-			confirmed_item_names:
-			search_result:
+			confirmed_items:
+
 
 		Returns:
 
 		"""
+		
+		if len(confirmed_items) == 0:
+			return []
+		
+		# 找到最大值
+		max_score = 0
+		for confirmed_item in confirmed_items:
+			score = confirmed_item.get("score")
+			if score > max_score:
+				max_score = score
+		
+		# 将超出最大值差异阈值的直接过滤掉
+		return [confirmed_item.get("item_name") for confirmed_item in confirmed_items if
+		        max_score - confirmed_item.get("score") <= MAX_SCORE_GAP]
 
 
 class ItemNameAligner:
