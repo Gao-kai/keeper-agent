@@ -130,7 +130,7 @@ class ConfirmItemNameNode(BaseNode):
 			3. 为什么稀疏向量无法进行归一化
 			4. IP和COSINE是度量标准，为什么归一化后选哪个都一样
 			5. 权重融合排序器weightedRanker的norm_score归一化是什么
-			6. 混合检索的工作原理：
+			6. 混合检索的工作原理
 			"""
 			hybrid_search_result = execute_hybrid_search(
 				milvus_client=milvus_client,
@@ -149,16 +149,16 @@ class ConfirmItemNameNode(BaseNode):
 			search_results:
 			[
 			    {
-			        "extracted_name": "DT-9205A",
-			        "matches": [
+			        "extracted_item_name": "DT-9205A",
+			        "matched_items": [
 			            {"item_name": "DT-9205A", "score": 0.95},
 			            {"item_name": "DT-9205B", "score": 0.72},
 			            {"item_name": "DT-9202",  "score": 0.61},
 			        ]
 			    },
 			    {
-			        "extracted_name": "万用表",
-			        "matches": [
+			        "extracted_item_name": "万用表",
+			        "matched_items": [
 			            {"item_name": "万用表UT61E", "score": 0.78},
 			            {"item_name": "DT-9205A",    "score": 0.62},
 			        ]
@@ -169,7 +169,7 @@ class ConfirmItemNameNode(BaseNode):
 			search_result.append({
 				"extracted_item_name": extracted_item_name,
 				"matched_items": [
-					{"item_name": hit.get("entity", {}).get("item_name"), "score": hit.get("score")} for hit in hits
+					{"item_name": hit.get("entity", {}).get("item_name"), "score": hit.get("distance")} for hit in hits
 				]
 			})
 		
@@ -245,16 +245,16 @@ class ConfirmItemNameNode(BaseNode):
 		
 			[
 			    {
-			        "extracted_name": "DT-9205A",
-			        "matches": [
+			        "'extracted_item_name'": "DT-9205A",
+			        "matched_items": [
 			            {"item_name": "DT-9205A", "score": 0.95},
 			            {"item_name": "DT-9205B", "score": 0.72},
 			            {"item_name": "DT-9202",  "score": 0.61},
 			        ]
 			    },
 			    {
-			        "extracted_name": "万用表",
-			        "matches": [
+			        "'extracted_item_name'": "万用表",
+			        "matched_items": [
 			            {"item_name": "万用表UT61E", "score": 0.78},
 			            {"item_name": "DT-9205A",    "score": 0.62},
 			        ]
@@ -267,8 +267,8 @@ class ConfirmItemNameNode(BaseNode):
 		
 		for index, item in enumerate(search_result):
 			# 获取从Milvus向量数据库检索到的和LLM识别出的商品名最匹配的matches列表
-			extracted_name = item.get("extracted_name")
-			matches = item.get("matches", [])
+			extracted_name = item.get("extracted_item_name")
+			matches = item.get("matched_items", [])
 			if not matches:
 				continue
 			
@@ -450,6 +450,7 @@ if __name__ == "__main__":
 	node = ConfirmItemNameNode()
 	node.process(
 		{
-			"original_query": "huawei Mate Station S12和H3C LA2608的区别是什么？"
+			# "original_query": "huawei Mate Station S12和H3C LA2608的区别是什么？",
+			"original_query": "你们店里面的Iphone17现在多少钱呢？"
 		}
 	)

@@ -74,32 +74,36 @@ def generate_hybrid_embeddings(
 		格式为 {token_id: weight}）两个键的混合嵌入结果
 	"""
 	
-	doc_embeddings = embedding_model.encode_documents(embedding_docs)
-	hybrid_embeddings_result = {
-		"dense": [],
-		"sparse": []
-	}
-	
-	# 解析稀疏和稠密向量
-	for index, chunk in enumerate(embedding_docs):
-		# 获取稠密向量dense
-		dense_vector = doc_embeddings['dense'][index].tolist()
+	try:
+		doc_embeddings = embedding_model.encode_documents(embedding_docs)
+		hybrid_embeddings_result = {
+			"dense": [],
+			"sparse": []
+		}
 		
-		# 获取稀疏向量CSR
-		sparse_matrix = doc_embeddings["sparse"]
+		# 解析稀疏和稠密向量
+		for index, chunk in enumerate(embedding_docs):
+			# 获取稠密向量dense
+			dense_vector = doc_embeddings['dense'][index].tolist()
+			
+			# 获取稀疏向量CSR
+			sparse_matrix = doc_embeddings["sparse"]
+			
+			# 获取第 i 句话非零元素的起止索引
+			start_idx = sparse_matrix.indptr[index]
+			end_idx = sparse_matrix.indptr[index + 1]
+			
+			# 提取对应的 Token IDs 和 权重
+			token_ids = sparse_matrix.indices[start_idx:end_idx].tolist()
+			weights = sparse_matrix.data[start_idx:end_idx].tolist()
+			
+			# 打包成字典 {tokenId:weight}
+			sparse_vector = dict(zip(token_ids, weights))
+			
+			hybrid_embeddings_result["dense"].append(dense_vector)
+			hybrid_embeddings_result["sparse"].append(sparse_vector)
 		
-		# 获取第 i 句话非零元素的起止索引
-		start_idx = sparse_matrix.indptr[index]
-		end_idx = sparse_matrix.indptr[index + 1]
-		
-		# 提取对应的 Token IDs 和 权重
-		token_ids = sparse_matrix.indices[start_idx:end_idx].tolist()
-		weights = sparse_matrix.data[start_idx:end_idx].tolist()
-		
-		# 打包成字典 {tokenId:weight}
-		sparse_vector = dict(zip(token_ids, weights))
-		
-		hybrid_embeddings_result["dense"].append(dense_vector)
-		hybrid_embeddings_result["sparse"].append(sparse_vector)
-	
-	return hybrid_embeddings_result
+		return hybrid_embeddings_result
+	except Exception as e:
+		logger.error(f"BGE-M3生成混合嵌入向量失败: {e}")
+		return None

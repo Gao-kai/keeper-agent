@@ -41,7 +41,6 @@ class QueryProcessError(Exception):
             parts.append(f"(原因: {self.cause})")
         return " ".join(parts)
 
-
 class ConfigurationError(QueryProcessError):
     """配置错误：环境变量缺失或配置值无效。"""
     pass

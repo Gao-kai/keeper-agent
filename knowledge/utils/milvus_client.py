@@ -68,6 +68,7 @@ def create_hybrid_search_request(
 		dense_params=None,
 		sparse_params=None,
 		expr=None,
+		expr_params=None,
 		limit=10
 ) -> List[AnnSearchRequest]:
 	"""
@@ -76,9 +77,12 @@ def create_hybrid_search_request(
 	Args:
 		dense_vector: 稠密向量，由 BGE-M3 生成的 dense 向量
 		sparse_vector: 稀疏向量，由 BGE-M3 生成的 sparse 向量（格式为 {token_id: weight}）
+		dense_req_field_name: 稠密向量字段名称
+		sparse_req_field_name: 稀疏向量字段名称
 		dense_params: 稠密检索参数，如 {"metric_type": "COSINE"}；默认使用 COSINE 度量
 		sparse_params: 稀疏检索参数，如 {"metric_type": "IP"}；默认使用 IP 度量
 		expr: 标量字段过滤表达式（类似 SQL 的 WHERE 条件）；None 表示不过滤
+		expr_params: 标量字段过滤表达式参数
 		limit: 每个检索器返回的结果数量上限，默认 10
 
 	Returns:
@@ -100,6 +104,7 @@ def create_hybrid_search_request(
 		anns_field=dense_req_field_name,
 		param=dense_params,
 		expr=expr,
+		expr_params=expr_params,
 		limit=limit
 	)
 
@@ -109,6 +114,7 @@ def create_hybrid_search_request(
 		anns_field=sparse_req_field_name,
 		param=sparse_params,
 		expr=expr,
+		expr_params=expr_params,
 		limit=limit
 	)
 
