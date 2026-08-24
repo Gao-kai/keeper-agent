@@ -1,11 +1,7 @@
 """
 混合向量检索节点
-
-1. 新增StateFieldError
-2. 并行节点中任何一个出错，都不能直接抛出程序异常
 """
-import json
-import logging
+
 
 from knowledge.processor.query_process.base import BaseNode, T
 from knowledge.processor.query_process.config import get_query_config
