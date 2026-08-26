@@ -168,19 +168,20 @@ class WebSearchMCPNode(BaseNode):
 		Returns:
 
 		"""
+		# 1. 基于Streamable HTTP 创建MCP服务端
+		search_mcp_server = MCPServerStreamableHttp(
+			name="百炼通用搜索 MCP Server",
+			params={
+				"url": query_config.mcp_dashscope_base_url,
+				"headers": {
+					"Authorization": f"Bearer {query_config.openai_api_key}"
+				}
+			},
+			cache_tools_list=True,
+			max_retry_attempts=5
+		)
+		
 		try:
-			# 1. 基于Streamable HTTP 创建MCP服务端
-			search_mcp_server = MCPServerStreamableHttp(
-				name="百炼通用搜索 MCP Server",
-				params={
-					"url": query_config.mcp_dashscope_base_url,
-					"headers": {
-						"Authorization": f"Bearer {query_config.openai_api_key}"
-					}
-				},
-				cache_tools_list=True,
-				max_retry_attempts=5
-			)
 			
 			# 2. 连接
 			await search_mcp_server.connect()
@@ -210,7 +211,7 @@ class WebSearchMCPNode(BaseNode):
 	
 	def format_tool_call_result(self, tool_call_result: CallToolResult):
 		if not tool_call_result:
-			return ""
+			return []
 		
 		self.log_step("step_4", f"格式化MCP服务返回结果")
 		web_search_docs = []

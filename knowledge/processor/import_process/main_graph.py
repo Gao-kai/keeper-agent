@@ -8,7 +8,7 @@ from knowledge.processor.import_process.nodes.chunk_embedding_node import ChunkE
 from knowledge.processor.import_process.nodes.document_split_node import DocumentSplitNode
 from knowledge.processor.import_process.nodes.entry_node import EntryNode
 from knowledge.processor.import_process.nodes.item_node_recognition_node import ItemNameRecognitionNode
-from knowledge.processor.import_process.nodes.knowledge_graph_node import KnowledgeGraphNode
+from knowledge.processor.import_process.nodes.import_knowledge_graph_node import KnowledgeGraphNode
 from knowledge.processor.import_process.nodes.md_img_node import MDImageNode
 from knowledge.processor.import_process.nodes.pdf_to_md_node import PDFToMarkDownNode
 from knowledge.processor.import_process.nodes.save_to_milvus_node import SaveToMilvusNode
