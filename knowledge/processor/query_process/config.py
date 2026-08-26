@@ -9,6 +9,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 import os
 
+from dotenv import load_dotenv
+
+# 加载 .env文件 强制.env加载的环境变量优先级高于系统环境变量
+load_dotenv(override=True)
 
 @dataclass
 class QueryConfig:
@@ -92,7 +96,7 @@ class QueryConfig:
 	
 	# ==================== MCP 配置 ====================
 	mcp_dashscope_base_url: str = field(
-		default_factory=lambda: os.getenv("MCP_DASHSCOPE_BASE_URL", "")
+		default_factory=lambda: os.getenv("DASHSCOPE_MCP_WEB_SEARCH_BASE_URL", "")
 	)
 	
 	@classmethod
