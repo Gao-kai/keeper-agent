@@ -84,11 +84,6 @@ def parse_and_clean_llm_response(llm_response: str) -> List[str]:
 	
 	return cleaned_entities
 
-
-"""
-EntityExtractor
-基于LLM抽取用户问题中可能包含的实体名称，并完成清洗
-"""
 MAX_ENTITY_NAME_LENGTH: int = 15
 
 ALLOWED_ENTITY_LABELS_CN: set = {
@@ -101,13 +96,16 @@ ALLOWED_ENTITY_LABELS_CN: set = {
 	"工具(Tool)"
 }
 
-
+"""
+EntityExtractor
+基于LLM抽取用户问题中可能包含的实体名称，并完成清洗
+"""
 class EntityExtractor:
 	
 	def __init__(self):
 		self._logger = logging.getLogger(self.__class__.__name__)
 	
-	def extract(self, rewritten_query: str):
+	def extract(self, rewritten_query: str)->List[str]:
 		if not rewritten_query:
 			self._logger.warning(f"用户输入{rewritten_query}为空，无法进行LLM实体提取")
 			return []
@@ -141,6 +139,14 @@ class EntityExtractor:
 			self._logger.error(f"LLM提取实体名称报错:{e}", exc_info=True)
 			return []
 
+
+class EntityAligner:
+	def __init__(self):
+		self._logger = logging.getLogger(self.__class__.__name__)
+		
+	def align(self,entities):
+		pass
+	
 
 class QueryKnowledgeGraphNode(BaseNode):
 	def process(self, state: QueryGraphState) -> QueryGraphState:
@@ -183,3 +189,4 @@ class QueryKnowledgeGraphNode(BaseNode):
 		cleaned_entities = entity_extractor.extract(rewritten_query)
 		
 		# 2. 基于抽取的实体名称和导入时存储在Milvus中的实体名称进行对齐
+		
