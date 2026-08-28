@@ -14,7 +14,6 @@ chunk_id 关联到 Entity         ←对应→     根据 chunk_id 从 Milvus �
 import json
 import logging
 import re
-from logging import Logger
 from typing import List, Dict, Any, Set
 from langchain_core.messages import SystemMessage, HumanMessage
 from knowledge.processor.query_process.base import BaseNode, T
