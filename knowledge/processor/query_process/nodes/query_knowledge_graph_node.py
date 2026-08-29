@@ -10,6 +10,9 @@ LLM 从文档中抽取实体             ←对应→     LLM 从问题中抽取
 实体/关系 → 写入 Neo4j          ←对应→     在 Neo4j 中查种子节点、扩展关系
 chunk_id 关联到 Entity         ←对应→     根据 chunk_id 从 Milvus 回填文本
 
+## 问题
+1. 为什么对齐的时候会返回得分相同的？
+
 """
 import json
 import logging
@@ -21,7 +24,10 @@ from knowledge.processor.query_process.config import get_query_config, QueryConf
 from knowledge.processor.query_process.exception import ValidationError
 from knowledge.processor.query_process.state import QueryGraphState
 from knowledge.prompts.query_prompt import ENTITY_EXTRACT_SYSTEM_PROMPT
+from knowledge.utils.bge_m3_embedding_model import get_bge_m3_embedding_model, generate_hybrid_embeddings
 from knowledge.utils.llm_client import get_llm_client
+from knowledge.utils.log_config import setup_logging
+from knowledge.utils.milvus_client import create_hybrid_search_request, execute_hybrid_search, get_milvus_client
 
 logger = logging.getLogger("工具函数")
 
@@ -83,8 +89,9 @@ def parse_and_clean_llm_response(llm_response: str) -> List[str]:
 	
 	return cleaned_entities
 
-MAX_ENTITY_NAME_LENGTH: int = 15
 
+MAX_ENTITY_NAME_LENGTH: int = 15
+ALIGN_QUERY_ENTITY_NAME_SCORE: float = 0.66
 ALLOWED_ENTITY_LABELS_CN: set = {
 	"设备(Device)"
 	"部件(Part)"
@@ -99,12 +106,14 @@ ALLOWED_ENTITY_LABELS_CN: set = {
 EntityExtractor
 基于LLM抽取用户问题中可能包含的实体名称，并完成清洗
 """
+
+
 class EntityExtractor:
 	
 	def __init__(self):
 		self._logger = logging.getLogger(self.__class__.__name__)
 	
-	def extract(self, rewritten_query: str)->List[str]:
+	def extract(self, rewritten_query: str) -> List[str]:
 		if not rewritten_query:
 			self._logger.warning(f"用户输入{rewritten_query}为空，无法进行LLM实体提取")
 			return []
@@ -142,10 +151,140 @@ class EntityExtractor:
 class EntityAligner:
 	def __init__(self):
 		self._logger = logging.getLogger(self.__class__.__name__)
-		
-	def align(self,entities):
-		pass
 	
+	def align(self, entities: List[str], item_names: List[str], config: QueryConfig) -> Dict[str, Any]:
+		
+		fallback_result = {
+			"entity_names": [],  # 将LLM返回的实体名称经过Milvus查询后对齐的实体名称
+			"entity_elements": []  # 将LLM返回的实体名称经过Milvus查询后对齐的实体信息
+		}
+		
+		if not entities:
+			return fallback_result
+		
+		# 1. 将所有LLM提取出来的实体进行向量化 获取混合向量（必须选用入库时的相同模型）
+		bge_m3_embedding_model = get_bge_m3_embedding_model()
+		if bge_m3_embedding_model is None:
+			self._logger.error(f"嵌入模型BGE-M3不存在")
+			return fallback_result
+		
+		milvus_client = get_milvus_client()
+		if milvus_client is None:
+			self._logger.error(f"Milvus客户端不存在")
+			return fallback_result
+		
+		hybrid_embeddings: Dict[str, Any] = generate_hybrid_embeddings(
+			embedding_model=bge_m3_embedding_model,
+			embedding_docs=entities
+		)
+		
+		if not hybrid_embeddings:
+			self._logger.error(f"LLM模型提取的实体名称获取混合向量失败")
+			return fallback_result
+		
+		# 2. 拿到混合向量去milvus中查询 找到TOP K个最相似实体名称（限制在同一个item_names中）
+		seen: set = set()
+		aligned_entity_names = []
+		aligned_entity_elements = []
+		for index, entity_name in enumerate(entities):
+			dense_vector = hybrid_embeddings["dense"][index]
+			sparse_vector = hybrid_embeddings["sparse"][index]
+			
+			aligned_result = self.align_by_one(
+				dense_vector=dense_vector,
+				sparse_vector=sparse_vector,
+				milvus_client=milvus_client,
+				config=config,
+				entity_name=entity_name,
+				item_names=item_names
+			)
+			
+			aligned_entity_name = aligned_result.get("aligned_entity_name")
+			if aligned_entity_name not in seen:
+				seen.add(aligned_entity_name)
+				aligned_entity_names.append(aligned_entity_name)
+				aligned_entity_elements.append(aligned_result)
+		
+		
+		return {
+			"aligned_entity_names":aligned_entity_names,
+			"aligned_entity_elements":aligned_entity_elements
+		}
+	
+	def align_by_one(self, dense_vector, sparse_vector, milvus_client, config, entity_name, item_names):
+		expr = "item_name IN {item_names}"
+		expr_params = {"item_names": item_names}
+		
+		# 构建混合查询
+		reqs = create_hybrid_search_request(
+			dense_vector=dense_vector,
+			sparse_vector=sparse_vector,
+			dense_req_field_name="entity_name_dense_vector",
+			sparse_req_field_name="entity_name_sparse_vector",
+			expr=expr,
+			expr_params=expr_params,
+			limit=5
+		)
+		
+		# 执行混合查询
+		hybrid_search_result = execute_hybrid_search(
+			milvus_client=milvus_client,
+			limit=5,
+			reqs=reqs,
+			collection_name=config.entity_name_collection,
+			output_fields=[
+				"entity_name",
+				"source_chunk_id",
+				"item_name",
+				"context"
+			],
+			ranker_weights=[0.5, 0.5],
+			norm_score=True
+		)
+		self._logger.info(f"实体名称{entity_name}检索完成")
+		
+		if not hybrid_search_result or not hybrid_search_result[0]:
+			self._logger.error(f"实体名称{entity_name}混合检索结果为空")
+			return {
+				"original_entity_name": entity_name,
+				"aligned_entity_name": "",
+				"reason": f"实体名称{entity_name}混合检索结果为空"
+			}
+	
+		
+		# 查找最佳的实体entity
+		best_entity = self.find_best_entity(hybrid_search_result[0])
+		if not best_entity:
+			return {
+				"original_entity_name": entity_name,
+				"aligned_entity_name": "",
+				"reason": f"实体名称{entity_name}混合检索结果相似度太低"
+			}
+	
+		
+		best_entity_fields = best_entity.get("entity", {})
+		return {
+			"original_entity_name": entity_name,
+			"aligned_entity_name": best_entity_fields.get("entity_name", ""),
+			"reason": f"TOP 1最相似的实体名称",
+			"source_chunk_id": best_entity_fields.get("source_chunk_id", ""),
+			"context": best_entity_fields.get("context", ""),
+			"item_name": best_entity_fields.get("item_name", ""),
+		}
+	
+	@staticmethod
+	def find_best_entity(hits: List[Dict[str, Any]]):
+		if not hits:
+			return None
+		
+		first_entity_hit = hits[0]
+		if not first_entity_hit:
+			return None
+		
+		distance = first_entity_hit.get("distance")
+		
+		return first_entity_hit if distance >= ALIGN_QUERY_ENTITY_NAME_SCORE else None
+
 
 class QueryKnowledgeGraphNode(BaseNode):
 	def process(self, state: QueryGraphState) -> QueryGraphState:
@@ -182,10 +321,23 @@ class QueryKnowledgeGraphNode(BaseNode):
 		Returns:
 
 		"""
-		self.log_step(step_name="STEP-2",message="抽取实体名称")
+		self.log_step(step_name="STEP-2", message="抽取实体名称")
 		# 1. 用户问题中抽取实体名称
 		entity_extractor = EntityExtractor()
 		cleaned_entities = entity_extractor.extract(rewritten_query)
 		
 		# 2. 基于抽取的实体名称和导入时存储在Milvus中的实体名称进行对齐
-		
+		entity_aligner = EntityAligner()
+		entity_aligner.align(cleaned_entities, item_names, query_config)
+
+
+if __name__ == "__main__":
+	setup_logging()
+	print("开始测试知识图谱查询节点")
+	_state: QueryGraphState = {
+		"rewritten_query": "H3C LA2608 室内无线网关怎么创建 WLAN-ESS 接口呢？",
+		"item_names": ["H3C LA2608 室内无线网关"]
+	}
+	query_knowledge_node = QueryKnowledgeGraphNode()
+	state = query_knowledge_node.process(_state)
+	print(state)

@@ -117,7 +117,9 @@ def create_hybrid_search_request(
 		expr_params=expr_params,
 		limit=limit
 	)
-
+	
+	# 这里返回的顺序很重要将直接决定了在执行混合检索的时候ranker_weights数组中的参数对应关系
+	# ranker_weights为[0.7.0.3] 意思就是稠密向量检索权重dense_req占比0.7 稀疏向量占比0.3
 	return [dense_req, sparse_req]
 
 

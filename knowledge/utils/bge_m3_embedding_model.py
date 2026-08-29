@@ -57,7 +57,7 @@ def get_bge_m3_embedding_model() -> Optional[BGEM3EmbeddingFunction]:
 def generate_hybrid_embeddings(
 		embedding_model: BGEM3EmbeddingFunction,
 		embedding_docs: List[str]
-) -> dict:
+) -> dict|None:
 	"""
 	为文档列表生成混合嵌入向量（稠密 + 稀疏）。
 
