@@ -12,6 +12,15 @@ chunk_id 关联到 Entity         ←对应→     根据 chunk_id 从 Milvus �
 
 ## 问题
 1. 为什么对齐的时候会返回得分相同的？
+核心原因是在入库的时候只对单个chunk中的entity_name做了去重
+多路并行处理的情况下一个实体名比如APP可能在CHUNK1和CHUNK2都加入到了向量库中
+当我拿着用户的问题比如"APP怎么打开"，提取出来APP然后构建混合向量去检索的时候，自然就会检索到多个chunk
+
+核心结论：distance 相同 ≠ 同一个实体。它既可能是"不同实体加权平均分恰好相等"（机制特性），也可能是"同一实体名被重复入库的多条记录"（数据问题）。后一种情况在你们的 find_best_entity 只看 hits[0] 的场景下影响不大，但如果后续要展示多条结果，建议：
+
+入库侧跨 chunk 对 entity_name 做全局去重（如入库前按 item_name + entity_name 查重），避免重复记录；
+查询侧按 entity_name 对 hybrid_search_result[0] 再做一次去重；
+若需要更精确的融合，可考虑 norm_score=False 或调整两个检索器的权重，拉开分数区分度。
 
 """
 import json
