@@ -171,7 +171,7 @@ class EntityAligner:
 		if not entities:
 			return fallback_result
 		
-		# 1. 将所有LLM提取出来的实体进行向量化 获取混合向量（必须选用入库时的相同模型）
+		# 1. LLM从用户问题中提取出来的所有实体进行向量化 获取混合向量（必须保证和入库时的嵌入模型一致性）
 		bge_m3_embedding_model = get_bge_m3_embedding_model()
 		if bge_m3_embedding_model is None:
 			self._logger.error(f"嵌入模型BGE-M3不存在")
@@ -191,6 +191,8 @@ class EntityAligner:
 			self._logger.error(f"LLM模型提取的实体名称获取混合向量失败")
 			return fallback_result
 		
+		self._logger.info(f"LLM提取出来的用户问题中的实体名称{entities} -> 成功生成BGE-M3向量嵌入模型混合向量 ")
+		
 		# 2. 拿到混合向量去milvus中查询 找到TOP K个最相似实体名称（限制在同一个item_names中）
 		seen: set = set()
 		aligned_entity_names = []
@@ -207,17 +209,18 @@ class EntityAligner:
 				entity_name=entity_name,
 				item_names=item_names
 			)
-			
-			aligned_entity_name = aligned_result.get("aligned_entity_name")
-			if aligned_entity_name not in seen:
-				seen.add(aligned_entity_name)
-				aligned_entity_names.append(aligned_entity_name)
-				aligned_entity_elements.append(aligned_result)
 		
+		# aligned_entity_name = aligned_result.get("aligned_entity_name")
+		# unique_key = (aligned_entity_name,)
+		# if aligned_entity_name not in seen:
+		# 	seen.add(aligned_entity_name)
+		# 	aligned_entity_names.append(aligned_entity_name)
+		# 	aligned_entity_elements.append(aligned_result)
+		#
 		
 		return {
-			"aligned_entity_names":aligned_entity_names,
-			"aligned_entity_elements":aligned_entity_elements
+			"aligned_entity_names": aligned_entity_names,
+			"aligned_entity_elements": aligned_entity_elements
 		}
 	
 	def align_by_one(self, dense_vector, sparse_vector, milvus_client, config, entity_name, item_names):
@@ -254,32 +257,54 @@ class EntityAligner:
 		
 		if not hybrid_search_result or not hybrid_search_result[0]:
 			self._logger.error(f"实体名称{entity_name}混合检索结果为空")
-			return {
-				"original_entity_name": entity_name,
-				"aligned_entity_name": "",
-				"reason": f"实体名称{entity_name}混合检索结果为空"
-			}
-	
+			return [
+				{
+					"original_entity_name": entity_name,
+					"aligned_entity_name": "",
+					"reason": f"实体名称{entity_name}混合检索结果为空"
+				}
+			]
 		
-		# 查找最佳的实体entity
-		best_entity = self.find_best_entity(hybrid_search_result[0])
-		if not best_entity:
-			return {
-				"original_entity_name": entity_name,
-				"aligned_entity_name": "",
-				"reason": f"实体名称{entity_name}混合检索结果相似度太低"
-			}
-	
+		# 构建基于不同的商品名称->实体名称映射
+		best_entity_by_item_name = {}
+		hits = hybrid_search_result[0]
+		for hit in hits:
+			entity = hit.get("entity")
+			item_name = entity.get("item_name", "")
+			# 相同商品名称的hit中天然得分高的排名靠前（因此天然保留同一个item_name下的最高得分hit）
+			if item_name not in best_entity_by_item_name:
+				best_entity_by_item_name[item_name] = hit
 		
-		best_entity_fields = best_entity.get("entity", {})
-		return {
-			"original_entity_name": entity_name,
-			"aligned_entity_name": best_entity_fields.get("entity_name", ""),
-			"reason": f"TOP 1最相似的实体名称",
-			"source_chunk_id": best_entity_fields.get("source_chunk_id", ""),
-			"context": best_entity_fields.get("context", ""),
-			"item_name": best_entity_fields.get("item_name", ""),
-		}
+		# 遍历best_entity_by_item_name
+		results = []
+		for item_name, best_hit_by_item in best_entity_by_item_name.items():
+			distance = best_hit_by_item.get("distance")
+			
+			if float(distance) <= ALIGN_QUERY_ENTITY_NAME_SCORE
+				continue
+			
+			best_item_entity_fields = best_hit_by_item.get("entity", {})
+			results.append(
+				{
+					"original_entity_name": entity_name,
+					"aligned_entity_name": best_item_entity_fields.get("entity_name", ""),
+					"reason": f"当前商品名称{best_item_entity_fields.get("item_name")}下最相似的实体名称",
+					"source_chunk_id": best_item_entity_fields.get("source_chunk_id", ""),
+					"context": best_item_entity_fields.get("context", ""),
+					"item_name": best_item_entity_fields.get("item_name", ""),
+				}
+			)
+		
+		if not results:
+			return [
+				{
+					"original_entity_name": entity_name,
+					"aligned_entity_name": "",
+					"reason": f"实体名称{entity_name}混合检索结果得分过低相似性太低"
+				}
+			]
+		
+		return results
 	
 	@staticmethod
 	def find_best_entity(hits: List[Dict[str, Any]]):
