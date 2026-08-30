@@ -28,7 +28,7 @@ import logging
 import re
 from typing import List, Dict, Any, Set
 from langchain_core.messages import SystemMessage, HumanMessage
-from knowledge.processor.query_process.base import BaseNode, T
+from knowledge.processor.query_process.base import BaseNode
 from knowledge.processor.query_process.config import get_query_config, QueryConfig
 from knowledge.processor.query_process.exception import ValidationError
 from knowledge.processor.query_process.state import QueryGraphState
@@ -201,7 +201,7 @@ class EntityAligner:
 			dense_vector = hybrid_embeddings["dense"][index]
 			sparse_vector = hybrid_embeddings["sparse"][index]
 			
-			aligned_result = self.align_by_one(
+			aligned_results = self.align_by_one(
 				dense_vector=dense_vector,
 				sparse_vector=sparse_vector,
 				milvus_client=milvus_client,
@@ -209,21 +209,27 @@ class EntityAligner:
 				entity_name=entity_name,
 				item_names=item_names
 			)
+			
+			for aligned_result in aligned_results:
+				
+				aligned_entity_name = aligned_result.get("aligned_entity_name", "")
+				item_name = aligned_result.get("item_name", "")
+				unique_key = (aligned_entity_name, item_name)
+				if unique_key not in seen:
+					seen.add(unique_key)
+					aligned_entity_names.append(aligned_entity_name)
+					aligned_entity_elements.append(aligned_result)
 		
-		# aligned_entity_name = aligned_result.get("aligned_entity_name")
-		# unique_key = (aligned_entity_name,)
-		# if aligned_entity_name not in seen:
-		# 	seen.add(aligned_entity_name)
-		# 	aligned_entity_names.append(aligned_entity_name)
-		# 	aligned_entity_elements.append(aligned_result)
-		#
+		self._logger.info(f"用户问题中的实体对齐个数为:{len(aligned_entity_names)}")
+		self._logger.info(f"用户问题中的实体对齐名字为:{aligned_entity_names}")
 		
 		return {
 			"aligned_entity_names": aligned_entity_names,
 			"aligned_entity_elements": aligned_entity_elements
 		}
 	
-	def align_by_one(self, dense_vector, sparse_vector, milvus_client, config, entity_name, item_names):
+	def align_by_one(self, dense_vector, sparse_vector, milvus_client, config, entity_name, item_names) -> List[
+		Dict[str, Any]]:
 		expr = "item_name IN {item_names}"
 		expr_params = {"item_names": item_names}
 		
@@ -266,6 +272,7 @@ class EntityAligner:
 			]
 		
 		# 构建基于不同的商品名称->实体名称映射
+		# 避免“请问万用表A和万用表B安装电池有啥不同？”大模型提取出的安装和电池两个实体名称匹配到不同商品名遗漏的问题
 		best_entity_by_item_name = {}
 		hits = hybrid_search_result[0]
 		for hit in hits:
@@ -275,12 +282,12 @@ class EntityAligner:
 			if item_name not in best_entity_by_item_name:
 				best_entity_by_item_name[item_name] = hit
 		
-		# 遍历best_entity_by_item_name
+		# 遍历best_entity_by_item_name 构建返回结果
 		results = []
 		for item_name, best_hit_by_item in best_entity_by_item_name.items():
 			distance = best_hit_by_item.get("distance")
 			
-			if float(distance) <= ALIGN_QUERY_ENTITY_NAME_SCORE
+			if float(distance) <= ALIGN_QUERY_ENTITY_NAME_SCORE:
 				continue
 			
 			best_item_entity_fields = best_hit_by_item.get("entity", {})
@@ -288,7 +295,7 @@ class EntityAligner:
 				{
 					"original_entity_name": entity_name,
 					"aligned_entity_name": best_item_entity_fields.get("entity_name", ""),
-					"reason": f"当前商品名称{best_item_entity_fields.get("item_name")}下最相似的实体名称",
+					"reason": f"商品 {best_item_entity_fields.get("item_name")} 中最相似的实体名称",
 					"source_chunk_id": best_item_entity_fields.get("source_chunk_id", ""),
 					"context": best_item_entity_fields.get("context", ""),
 					"item_name": best_item_entity_fields.get("item_name", ""),
@@ -305,19 +312,6 @@ class EntityAligner:
 			]
 		
 		return results
-	
-	@staticmethod
-	def find_best_entity(hits: List[Dict[str, Any]]):
-		if not hits:
-			return None
-		
-		first_entity_hit = hits[0]
-		if not first_entity_hit:
-			return None
-		
-		distance = first_entity_hit.get("distance")
-		
-		return first_entity_hit if distance >= ALIGN_QUERY_ENTITY_NAME_SCORE else None
 
 
 class QueryKnowledgeGraphNode(BaseNode):
