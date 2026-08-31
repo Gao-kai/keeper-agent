@@ -23,11 +23,17 @@ chunk_id 关联到 Entity         ←对应→     根据 chunk_id 从 Milvus �
 若需要更精确的融合，可考虑 norm_score=False 或调整两个检索器的权重，拉开分数区分度。
 
 """
+
+# ================================================================
+# 导入区
+# ================================================================
 import json
 import logging
 import re
 from typing import List, Dict, Any, Set, Optional, NotRequired, TypedDict
+
 from langchain_core.messages import SystemMessage, HumanMessage
+
 from knowledge.processor.query_process.base import BaseNode
 from knowledge.processor.query_process.config import get_query_config, QueryConfig
 from knowledge.processor.query_process.exception import ValidationError, Neo4jError
@@ -39,21 +45,32 @@ from knowledge.utils.log_config import setup_logging
 from knowledge.utils.milvus_client import create_hybrid_search_request, execute_hybrid_search, get_milvus_client
 from knowledge.utils.neo4j_client import get_neo4j_client
 
+# ================================================================
+# 常量与模块级日志
+# ================================================================
 logger = logging.getLogger("工具函数")
 
+# 实体名称最大长度：LLM 抽取与入库截断均以此为上限
 MAX_ENTITY_NAME_LENGTH: int = 15
+
+# 实体对齐相似度阈值：低于该得分的弱匹配被过滤（Milvus distance）
 ALIGN_QUERY_ENTITY_NAME_SCORE: float = 0.66
+
+# LLM 抽取实体时允许的实体标签（注入系统提示词，约束输出类别）
+# 注意：集合元素之间必须用逗号分隔，否则相邻字符串字面量会被 Python 隐式拼接成一个
 ALLOWED_ENTITY_LABELS_CN: set = {
-	"设备(Device)"
-	"部件(Part)"
-	"操作(Operation)"
-	"步骤(Step)"
-	"警告(Warning)"
-	"条件(Condition)"
-	"工具(Tool)"
+	"设备(Device)",
+	"部件(Part)",
+	"操作(Operation)",
+	"步骤(Step)",
+	"警告(Warning)",
+	"条件(Condition)",
+	"工具(Tool)",
 }
 
-
+# ================================================================
+# 工具函数区：LLM 响应解析
+# ================================================================
 def parse_and_clean_llm_response(llm_response: str) -> List[str]:
 	"""
 	解析并清洗 LLM 返回的实体抽取结果。
@@ -111,66 +128,14 @@ def parse_and_clean_llm_response(llm_response: str) -> List[str]:
 	
 	return cleaned_entities
 
-
-class EntityExtractor:
-	"""
-	实体抽取器：基于 LLM 从用户问题中抽取实体名称。
-
-	工作流程：
-	1. 空值兜底：用户问题为空或 LLM 客户端不可用时直接返回空列表；
-	2. 构造提示词：将允许的实体标签（ALLOWED_ENTITY_LABELS_CN）与实体名
-	   长度上限（MAX_ENTITY_NAME_LENGTH）注入系统提示词，约束 LLM 输出；
-	3. 调用 LLM：要求以 JSON 格式返回 {"entities": [...]}；
-	4. 清洗结果：通过 parse_and_clean_llm_response 完成代码围栏剥离、
-	   反序列化、非字符串过滤、长度截断与去重。
-
-	典型调用场景：QueryKnowledgeGraphNode.query_graph_pipeline 中先由此类
-	从改写后的问题中抽取实体，再交给 EntityAligner 到 Milvus 实体名称
-	集合中对齐。
-
-	Attributes:
-		_logger: 以类名命名的日志记录器
-	"""
-	
-	def __init__(self):
-		self._logger = logging.getLogger(self.__class__.__name__)
-	
-	def extract(self, rewritten_query: str) -> List[str]:
-		if not rewritten_query:
-			self._logger.warning(f"用户输入{rewritten_query}为空，无法进行LLM实体提取")
-			return []
-		
-		llm_client = get_llm_client(response_json=True)
-		if llm_client is None:
-			self._logger.warning(f"LLM客户端连接失败 无法进行LLM实体提取")
-			return []
-		
-		try:
-			human_message = f"用户问题：{rewritten_query}"
-			system_message = ENTITY_EXTRACT_SYSTEM_PROMPT.format(
-				ALLOWED_ENTITY_LABELS_CN=ALLOWED_ENTITY_LABELS_CN,
-				MAX_ENTITY_NAME_LENGTH=MAX_ENTITY_NAME_LENGTH
-			)
-			response = llm_client.invoke(
-				[
-					SystemMessage(content=system_message),
-					HumanMessage(content=human_message)
-				]
-			)
-			
-			if not response:
-				return []
-			
-			content = getattr(response, "content")
-			cleaned_entities = parse_and_clean_llm_response(content)
-			return cleaned_entities
-		
-		except Exception as e:
-			self._logger.error(f"LLM提取实体名称报错:{e}", exc_info=True)
-			return []
-
-
+# ================================================================
+# 数据类型定义区：与 TS interface 对应的结构类型
+# ================================================================
 class Neo4jQueryPair(TypedDict):
+	"""
+	Neo4j 查询参数对：以 (item_name, entity_name) 唯一定位一个实体节点。
+	与导入侧写入 Neo4j 时使用的键一致，保证读写对应。
+	"""
 	item_name: str
 	entity_name: str
 
@@ -212,7 +177,86 @@ class EntityAlignResult(TypedDict):
 	aligned_entity_names: List[str]
 	aligned_entity_fields: List[AlignedEntityResult]
 
+# ================================================================
+# 实体抽取器：LLM 从用户问题中抽取实体名称
+# ================================================================
+class EntityExtractor:
+	"""
+	实体抽取器：基于 LLM 从用户问题中抽取实体名称。
 
+	工作流程：
+	1. 空值兜底：用户问题为空或 LLM 客户端不可用时直接返回空列表；
+	2. 构造提示词：将允许的实体标签（ALLOWED_ENTITY_LABELS_CN）与实体名
+	   长度上限（MAX_ENTITY_NAME_LENGTH）注入系统提示词，约束 LLM 输出；
+	3. 调用 LLM：要求以 JSON 格式返回 {"entities": [...]}；
+	4. 清洗结果：通过 parse_and_clean_llm_response 完成代码围栏剥离、
+	   反序列化、非字符串过滤、长度截断与去重。
+
+	典型调用场景：QueryKnowledgeGraphNode.query_graph_pipeline 中先由此类
+	从改写后的问题中抽取实体，再交给 EntityAligner 到 Milvus 实体名称
+	集合中对齐。
+
+	Attributes:
+		_logger: 以类名命名的日志记录器
+	"""
+	
+	def __init__(self):
+		self._logger = logging.getLogger(self.__class__.__name__)
+	
+	def extract(self, rewritten_query: str) -> List[str]:
+		"""
+		从用户问题中抽取实体名称。
+
+		1. 空问题或 LLM 客户端不可用 → 返回空列表；
+		2. 以 ENTITY_EXTRACT_SYSTEM_PROMPT 为系统提示词，约束 LLM 以
+		   JSON 格式返回 {"entities": [...]}；
+		3. 返回结果经 parse_and_clean_llm_response 清洗去重。
+
+		Args:
+			rewritten_query: 大模型改写后的用户问题
+
+		Returns:
+			List[str]: 清洗后的实体名称列表；任何异常均返回空列表
+		"""
+		# 1. 空值兜底：用户问题为空无法抽取
+		if not rewritten_query:
+			self._logger.warning(f"用户输入{rewritten_query}为空，无法进行LLM实体提取")
+			return []
+		
+		# 2. 客户端检查：LLM 客户端不可用则降级为空结果
+		llm_client = get_llm_client(response_json=True)
+		if llm_client is None:
+			self._logger.warning(f"LLM客户端连接失败 无法进行LLM实体提取")
+			return []
+		
+		# 3. 构造提示词并调用 LLM，返回后清洗
+		try:
+			human_message = f"用户问题：{rewritten_query}"
+			system_message = ENTITY_EXTRACT_SYSTEM_PROMPT.format(
+				ALLOWED_ENTITY_LABELS_CN=ALLOWED_ENTITY_LABELS_CN,
+				MAX_ENTITY_NAME_LENGTH=MAX_ENTITY_NAME_LENGTH
+			)
+			response = llm_client.invoke(
+				[
+					SystemMessage(content=system_message),
+					HumanMessage(content=human_message)
+				]
+			)
+			
+			if not response:
+				return []
+			
+			content = getattr(response, "content")
+			cleaned_entities = parse_and_clean_llm_response(content)
+			return cleaned_entities
+		
+		except Exception as e:
+			self._logger.error(f"LLM提取实体名称报错:{e}", exc_info=True)
+			return []
+
+# ================================================================
+# 实体对齐器：实体名称在 Milvus 中的检索对齐
+# ================================================================
 class EntityAligner:
 	"""
 	实体对齐器：将 LLM 抽取出的实体名称与知识库中的规范实体名称对齐。
@@ -239,16 +283,32 @@ class EntityAligner:
 		self._logger = logging.getLogger(self.__class__.__name__)
 	
 	def align(self, entities: List[str], item_names: List[str], config: QueryConfig) -> EntityAlignResult:
-		
+		"""
+		将 LLM 抽取的实体名称与 Milvus 实体名称集合中的规范实体名对齐。
+
+		1. 为空 / 模型缺失 / 客户端缺失 / 向量化失败 → 返回空结果的 fallback_result；
+		2. 逐实体调用 align_by_one 做混合检索（限定 item_names 范围）；
+		3. 按 (aligned_entity_name, item_name) 去重后汇总。
+
+		Args:
+			entities: LLM 抽取的实体名称列表
+			item_names: 商品名称列表，用于限定检索范围
+			config: 查询配置（含实体名称集合名等）
+
+		Returns:
+			EntityAlignResult: 对齐成功的实体名列表 + 每个实体的对齐详情列表
+		"""
+		# fallback：对齐失败/无输入时的空结果，键名与正常返回保持一致
 		fallback_result: EntityAlignResult = {
 			"aligned_entity_names": [],  # 将LLM返回的实体名称经过Milvus查询后对齐的实体名称
 			"aligned_entity_fields": []  # 将LLM返回的实体名称经过Milvus查询后对齐的实体信息
 		}
 		
+		# 1. 前置校验：实体列表为空直接返回
 		if not entities:
 			return fallback_result
 		
-		# 1. LLM从用户问题中提取出来的所有实体进行向量化 获取混合向量（必须保证和入库时的嵌入模型一致性）
+		# 2. 依赖检查：嵌入模型与 Milvus 客户端必须可用
 		bge_m3_embedding_model = get_bge_m3_embedding_model()
 		if bge_m3_embedding_model is None:
 			self._logger.error(f"嵌入模型BGE-M3不存在")
@@ -259,6 +319,7 @@ class EntityAligner:
 			self._logger.error(f"Milvus客户端不存在")
 			return fallback_result
 		
+		# 3. 实体向量化：必须保证和入库时的嵌入模型一致性
 		hybrid_embeddings: Dict[str, Any] = generate_hybrid_embeddings(
 			embedding_model=bge_m3_embedding_model,
 			embedding_docs=entities
@@ -270,7 +331,7 @@ class EntityAligner:
 		
 		self._logger.info(f"LLM提取出来的用户问题中的实体名称{entities} -> 成功生成BGE-M3向量嵌入模型混合向量 ")
 		
-		# 2. 拿到混合向量去milvus中查询 找到TOP K个最相似实体名称（限制在同一个item_names中）
+		# 4. 逐个实体检索对齐，并按 (aligned_entity_name, item_name) 去重汇总
 		seen: set = set()
 		aligned_entity_names = []
 		aligned_entity_fields = []
@@ -307,10 +368,22 @@ class EntityAligner:
 	
 	def align_by_one(self, dense_vector, sparse_vector, milvus_client, config, entity_name, item_names) -> List[
 		AlignedEntityResult]:
+		"""
+		单个实体名称的混合检索与对齐。
+
+		1. 构造混合检索请求（稠密 + 稀疏向量，权重 0.5/0.5，norm_score=True）；
+		2. 在 entity_name_collection 中按 "item_name IN ..." 过滤检索 TOP-K；
+		3. 同一商品名称下只保留得分最高的 hit（避免同实体名重复入库记录干扰）；
+		4. 得分低于 ALIGN_QUERY_ENTITY_NAME_SCORE 的弱匹配被过滤。
+
+		Returns:
+			List[AlignedEntityResult]: 对齐结果；检索为空或得分过低时返回带 reason 的失败条目
+		"""
+		# 1. 构造查询表达式：限定商品范围
 		expr = "item_name IN {item_names}"
 		expr_params = {"item_names": item_names}
 		
-		# 构建混合查询
+		# 2. 构建混合查询请求
 		reqs = create_hybrid_search_request(
 			dense_vector=dense_vector,
 			sparse_vector=sparse_vector,
@@ -321,7 +394,7 @@ class EntityAligner:
 			limit=5
 		)
 		
-		# 执行混合查询
+		# 3. 执行混合查询
 		hybrid_search_result = execute_hybrid_search(
 			milvus_client=milvus_client,
 			limit=5,
@@ -338,6 +411,7 @@ class EntityAligner:
 		)
 		self._logger.info(f"实体名称{entity_name}检索完成")
 		
+		# 4. 检索结果为空时返回失败条目
 		if not hybrid_search_result or not hybrid_search_result[0]:
 			self._logger.error(f"实体名称{entity_name}混合检索结果为空")
 			return [
@@ -366,7 +440,7 @@ class EntityAligner:
 		所以这里先以商品名称为key，以该商品最高得分hit为value构建map，避免遗漏
 		"""
 		
-		# 构建基于不同的商品名称->实体名称映射
+		# 5. 构建基于不同的商品名称 -> 实体名称映射
 		best_entity_by_item_name = {}
 		hits = hybrid_search_result[0]
 		for hit in hits:
@@ -376,7 +450,7 @@ class EntityAligner:
 			if item_name not in best_entity_by_item_name:
 				best_entity_by_item_name[item_name] = hit
 		
-		# 遍历best_entity_by_item_name 构建返回结果
+		# 6. 遍历best_entity_by_item_name 构建返回结果，过滤得分过低的弱匹配
 		results = []
 		for item_name, best_hit_by_item in best_entity_by_item_name.items():
 			distance = best_hit_by_item.get("distance")
@@ -397,6 +471,7 @@ class EntityAligner:
 				}
 			)
 		
+		# 7. 全部未过阈值时返回失败条目
 		if not results:
 			return [
 				{
@@ -409,7 +484,9 @@ class EntityAligner:
 		
 		return results
 
-
+# ================================================================
+# 查询编排节点：实体抽取 → 实体对齐 → Neo4j 种子节点查询
+# ================================================================
 class QueryKnowledgeGraphNode(BaseNode):
 	"""
 	知识图谱查询节点（查询工作流中的一个图节点）。
@@ -426,6 +503,10 @@ class QueryKnowledgeGraphNode(BaseNode):
 	依赖 state:
 		item_names: 商品名称列表，用于限定检索范围
 		rewritten_query: 大模型改写后的用户问题
+
+	输出 state:
+		aligned_entities: 实体对齐结果列表（AlignedEntityResult）
+		kg_seed_nodes: 在 Neo4j 中定位到的种子节点列表（{"item_name", "entity_name"}）
 	"""
 	
 	def process(self, state: QueryGraphState) -> QueryGraphState:
@@ -439,6 +520,18 @@ class QueryKnowledgeGraphNode(BaseNode):
 		return state
 	
 	def validate_inputs(self, state: QueryGraphState):
+		"""
+		校验查询节点必需的输入参数。
+
+		Args:
+			state: 查询图共享状态
+
+		Returns:
+			tuple: (item_names, rewritten_query)
+
+		Raises:
+			ValidationError: item_names 或 rewritten_query 缺失/类型不正确
+		"""
 		item_names = state.get("item_names")
 		rewritten_query = state.get("rewritten_query")
 		
@@ -457,16 +550,18 @@ class QueryKnowledgeGraphNode(BaseNode):
 		步骤：
 		1. 实体抽取：通过 EntityExtractor + LLM 从改写后的问题中抽取实体名称；
 		2. 实体对齐：通过 EntityAligner 将抽取的实体与 Milvus 中的规范实体
-		   名称对齐（当前对齐结果仅记录日志，尚未回写 state）。
+		   名称对齐；
+		3. 构造 Neo4j 查询参数对：(item_name, entity_name) 与入库键保持一致；
+		4. 查询种子节点：通过 Neo4jGraphReader 精确/模糊查询，格式化结果。
 
 		Args:
 			rewritten_query: 大模型改写后的用户问题
 			item_names: 商品名称列表，用于限定实体检索范围
 			query_config: 查询配置（含实体名称集合名等）
-			state: 查询图共享状态
+			state: 查询图共享状态（本方法会原地写入 aligned_entities 与 kg_seed_nodes）
 
 		Returns:
-			None
+			None：结果通过修改 state 透出
 		"""
 		self.log_step(step_name="STEP-2", message="抽取实体名称")
 		# 1. 用户问题中抽取实体名称
@@ -481,17 +576,42 @@ class QueryKnowledgeGraphNode(BaseNode):
 		# 保证传递给Neo4j的是(item_name,entity_name)的参数对 因为存入Neo4j的时候key就是该参数对组成的 保证查询一体化
 		aligned_entity_names = entity_aligned_result.get("aligned_entity_names", [])
 		aligned_entity_fields = entity_aligned_result.get("aligned_entity_fields", [])
+	
 		
 		if not aligned_entity_names or not aligned_entity_fields:
+			self.logger.warning("没有可用的对齐实体，跳过 Neo4j 种子节点查询")
 			return
 		query_pairs = self.get_neo4j_query_pairs(aligned_entity_fields)
 		
 		# 4. 基于查询信息在Neo4j知识图谱中查询种子节点
-		neo4j_graph_reader = Neo4jGraphReader()
-		seed_node = neo4j_graph_reader.find_seed_nodes(query_pairs, query_config)
+		neo4j_graph_reader = Neo4jGraphReader(config=query_config)
+		seed_nodes = neo4j_graph_reader.find_seed_nodes(query_pairs)
+		cleaned_seed_nodes = []
+		for seed_node in seed_nodes:
+			item_name = seed_node["n.item_name"]
+			entity_name = seed_node["n.name"]
+			cleaned_seed_nodes.append({
+				"item_name":item_name,
+				"entity_name":entity_name
+			})
+		
+		self.logger.info(f"查询到的种子节点为:{cleaned_seed_nodes}")
+		
 	
 	@staticmethod
 	def get_neo4j_query_pairs(aligned_entity_fields: List[AlignedEntityResult]) -> List[Neo4jQueryPair]:
+		"""
+		将对齐结果转换为 Neo4j 查询参数对列表。
+
+		规则：同一商品名称下实体名称不允许重复，不同商品名称下实体名称允许重复，
+		最终以 (item_name, entity_name) 去重。
+
+		Args:
+			aligned_entity_fields: 实体对齐详情列表
+
+		Returns:
+			List[Neo4jQueryPair]: 去重后的查询参数对列表
+		"""
 		query_pairs: List[Neo4jQueryPair] = []
 		seen: set = set()
 		for aligned_entity_field in aligned_entity_fields:
@@ -512,51 +632,52 @@ class QueryKnowledgeGraphNode(BaseNode):
 		
 		return query_pairs
 
-
+# ================================================================
+# Neo4j 图查询器：种子节点的精确/模糊查询
+# ================================================================
 class Neo4jGraphReader:
 	"""
-	种子节点的精确查询
-	种子节点的模糊查询（降级）
-	种子节点一跳关系查询（双向）
-	基于种子节点和邻居节点反向查询Chunk item_name和id
-	根据所有的chunk_id查询milvus得到chunk
+	Neo4j 图查询器：在知识图谱中定位种子节点。
 
-	python中定义类型 类似ts中interface
+	核心逻辑：
+	1. 精确查询优先：以 (item_name, entity_name) 精确匹配 ENTITY 节点；
+	2. 模糊查询兜底：精确未命中时，用 toLower + CONTAINS 做模糊匹配（最多 3 条）；
+	3. 数量上限：返回的种子节点数不超过 max_seed_per_node。
 
-	原则是同一个商品名称 只能留一个实体 得分最高的 给下游的neo4j
-	不同商品名称 可以留多个
+	对齐规则（与 EntityAligner 保持一致）：
+	- 同一商品名称下只保留一个实体（得分最高的）；
+	- 不同商品名称下可以保留多个实体。
+	例如：电池 -> [A, B, C]；安装 -> [B, C]，
+	最终可得到 (A,电池)(B,电池)(B,安装)(C,电池)(C,安装) 等组合。
 
-	电池 =》 align one =〉 【A B C】
-	安装 =》 align One =〉 【B C】
-
-	A 电池
-	B 电池
-	B 安装
-	C 电池
-	C 安装
-
-	neo4j_driver的事务查询
-	SQL的事务到底是什么东西呢
+	Attributes:
+		database: Neo4j 数据库名
+		_max_seed_candidates: 种子节点数量上限
+		_max_total_seeds: 总种子节点上限
+		neo4j_driver: Neo4j 驱动实例
 	"""
 	
 	def __init__(self, config: QueryConfig):
 		self.logger = logging.getLogger(self.__class__.__name__)
 		self.database = config.neo4j_database
-		self.max_seed_per_node = 10
+		self._max_seed_candidates = config.kg_max_seed_candidates # 每个实体最大种子候选数
+		self._max_total_seeds = config.kg_max_total_seeds  # 总种子节点上限
+		
 		# 获取neo4j客户端及数据库
 		self.neo4j_driver = get_neo4j_client()
 		if self.neo4j_driver is None:
 			raise Neo4jError(node_name="Neo4jGraphReader查询类", message="Neo4j客户端连接失败")
 	
-	def find_seed_nodes(self, query_pairs: List[Neo4jQueryPair], config: QueryConfig):
+	def find_seed_nodes(self, query_pairs: List[Neo4jQueryPair]):
 		"""
-		1. 精确查询优先
-		2. 模糊查询兜底
+		查询种子节点：精确匹配优先，失败后模糊查询兜底。
+
 		Args:
-		 config:
-			query_pairs:
+			query_pairs: (item_name, entity_name) 查询参数对列表
 
 		Returns:
+			list[Record]: Neo4j 查询返回的记录列表（列名为 n.name / n.item_name），
+			数量上限为 max_seed_per_node；入参为空或查询异常时返回空列表
 		"""
 		if not query_pairs:
 			self.logger.error("用于查询Neo4j图数据库的数据不存在")
@@ -566,11 +687,10 @@ class Neo4jGraphReader:
 		seed_nodes = []
 		try:
 			for query_pair in query_pairs:
-				
 				item_name = query_pair.get("item_name", "")
 				entity_name = query_pair.get("entity_name", "")
 				
-				# 精确查询操作（读取种子节点；实体节点的属性名与导入侧保持一致为 name）
+				# 1. 精确查询操作（读取种子节点；实体节点的属性名与导入侧保持一致为 name）
 				accurate_query_result = self.neo4j_driver.execute_query(
 					query_="""
 						MATCH (n:ENTITY {item_name:$item_name, name:$entity_name})
@@ -583,11 +703,12 @@ class Neo4jGraphReader:
 					database_=self.database
 				)
 				
-				if accurate_query_result:
-					seed_nodes.append(accurate_query_result)
+				# 精确命中则收集记录并跳过模糊查询
+				if accurate_query_result.records:
+					seed_nodes.extend(accurate_query_result.records)
 					continue
 				
-				# 如果精确查询失败 模糊查询3条兜底
+				# 2. 精确查询失败 → 模糊查询3条兜底
 				fuzzy_query_result = self.neo4j_driver.execute_query(
 					query_="""
 						MATCH (n:ENTITY)
@@ -598,18 +719,21 @@ class Neo4jGraphReader:
 					parameters_={
 						"entity_name": entity_name,
 						"item_name": item_name,
-						"limit": 3
+						"limit": self._max_seed_candidates
 					},
 					database_=self.database
 				)
 				
-				seed_nodes.append(fuzzy_query_result)
+				# 模糊查询同样取 records（EagerResult 不是可迭代对象，不能直接 extend）
+				seed_nodes.extend(fuzzy_query_result.records)
 		except Exception as e:
 			self.logger.error(f"查询种子节点报错:{e}")
 		
-		return seed_nodes[:self.max_seed_per_node]
+		return seed_nodes[:self._max_total_seeds]
 
-
+# ================================================================
+# 本地测试
+# ================================================================
 if __name__ == "__main__":
 	setup_logging()
 	print("开始测试知识图谱查询节点")
