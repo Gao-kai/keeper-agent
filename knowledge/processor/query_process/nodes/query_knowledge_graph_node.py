@@ -912,12 +912,60 @@ class Neo4jGraphReader:
 	
 	def query_chunk_id_by_node_weight(self, nodes_weight_list):
 		"""
-		基于加权后的节点信息反查节点对应的chunk_id
+		基于加权后的节点信息反查节点对应的 chunk_id。
+		最后返回的 chunk_id 一定是按"权重得分最高、被最多实体节点提及"的顺序排列的
+		（排序规则见下方 Cypher 解释）。
+
+		为什么必须做这一步反查，而不能直接拿实体节点上的 chunk_id 去 Milvus 做标量过滤？
+		1. 实体节点上的 source_chunk_id 只在节点首次创建时写入（导入侧 ON CREATE 分支），
+		   同一实体在其它 chunk 再次出现时（ON MATCH 分支）不会更新它，
+		   因此它只代表实体"首次出现"的 chunk，会漏掉该实体出现的其它所有 chunk；
+		2. 而 ENTITY -[:MENTIONED_IN]- CHUNK 关系在实体每次出现的 chunk 上都会建立一条，
+		   才是"实体 ↔ 全部出现 chunk"的完整映射，反查正是沿这条关系补齐所有相关 chunk；
+		3. 打分与排序（权重求和 + 提及次数）可以下推给图数据库聚合完成，
+		   而 Milvus 的标量过滤只能筛出命中的 chunk，拿不到这份加权排序；
+		4. 附带：Milvus 主键 chunk_id 为 INT64 自增 id，链路中存储的是其字符串形式，
+		   即便要直接过滤也需先做类型转换，不如走图谱反查一步到位。
+
+		打分逻辑（图结构加权聚合）：
+		1. 入参 nodes_weight_list 是 collect_nodes_by_weight 产出的"实体节点 + 权重"列表，
+		   每个元素形如 {"item_name":..., "entity_name":..., "weight":...}；
+		   权重已在上一阶段直接指定（种子节点 SEED_NODE_WEIGHT / 一跳邻居 NBR_NODE_WEIGHT），
+		   并非本查询计算得出。
+		2. 本查询通过 ENTITY -[:MENTIONED_IN]- CHUNK 关系，把每个实体节点映射到它被提及的文本块，
+		   再按 chunk 分组，将"所有提及该 chunk 的实体节点的权重之和"作为该 chunk 的总分。
+		   即：实体节点的权重越高，它提及的 chunk 得分越高（实体权重 → chunk 的加权聚合，
+		   查询内部不存在实体到实体的多跳传播）。
+
+		Cypher 语句逐句解释：
+		- UNWIND $nodes_weight_list AS node_with_weight
+			把权重列表摊开成多行，每行对应一个 (entity_name, item_name, weight)；
+		- MATCH (entity:ENTITY {name:node_with_weight.entity_name, item_name:node_with_weight.item_name})
+			精确匹配 ENTITY 节点，用 name + item_name 双条件定位
+			（item_name 用于区分不同文档/商品下的同名实体）；
+		- -[:MENTIONED_IN]-(chunk:CHUNK {item_name:node_with_weight.item_name})
+			无向关系匹配：从实体沿 MENTIONED_IN 边找到它"被提及于"的 CHUNK 节点（限定同 item_name）；
+			一个实体可能提及多个 chunk，因此行数会扇出；
+		- WITH chunk, sum(node_with_weight.weight) AS total_score, count(entity) AS total_counts
+			按 chunk 分组聚合：
+			  total_score  = 提及该 chunk 的所有实体节点权重之和（实体权重越高，chunk 总分越高）；
+			  total_counts = 提及该 chunk 的实体个数（反映覆盖度/提及次数）；
+		- RETURN chunk.chunk_id AS chunk_id, chunk.item_name AS item_name, total_score, total_counts
+			输出每个 chunk 的标识与得分；
+		- ORDER BY total_score DESC, total_counts DESC, chunk_id ASC
+			按总分降序；同分按提及次数降序；再同分按 chunk_id 升序（保证排序结果确定性）；
+		- LIMIT $limit
+			只取分数最高的前 $limit 个 chunk（即 self._max_total_chunks）。
+
 		Args:
-			nodes_weight_list:
+			nodes_weight_list: 带权重的实体节点列表，形如
+				[{"item_name": str, "entity_name": str, "weight": float}, ...]，
+				由 collect_nodes_by_weight 生成；为空时直接返回 []。
 
 		Returns:
-
+			chunk_id_list: 反查得到的 chunk_id 列表。
+				注意：当前实现中下方 for 循环仅做局部赋值、未 append 进 chunk_id_list，
+				故实际恒返回 []，属待修复的遗留问题。
 		"""
 		if not nodes_weight_list:
 			self.logger.info("加权节点列表为空")
@@ -937,7 +985,8 @@ class Neo4jGraphReader:
 				LIMIT $limit
 				""",
 				parameters_={
-					"limit": self._max_total_chunks
+					"limit": self._max_total_chunks,
+					"nodes_weight_list":nodes_weight_list
 				}
 			)
 			
