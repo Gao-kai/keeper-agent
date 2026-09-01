@@ -30,7 +30,7 @@ chunk_id 关联到 Entity         ←对应→     根据 chunk_id 从 Milvus �
 import json
 import logging
 import re
-from typing import List, Dict, Any, Set, Optional, NotRequired, TypedDict
+from typing import List, Dict, Any, Set, Optional, NotRequired, TypedDict, Tuple
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -50,6 +50,12 @@ from knowledge.utils.neo4j_client import get_neo4j_client
 # ================================================================
 logger = logging.getLogger("工具函数")
 
+# 种子节点权重
+SEED_NODE_WEIGHT = 2
+
+# 一跳范围内邻居节点权重
+NBR_NODE_WEIGHT = 1
+
 # 实体名称最大长度：LLM 抽取与入库截断均以此为上限
 MAX_ENTITY_NAME_LENGTH: int = 15
 
@@ -67,6 +73,7 @@ ALLOWED_ENTITY_LABELS_CN: set = {
 	"条件(Condition)",
 	"工具(Tool)",
 }
+
 
 # ================================================================
 # 工具函数区：LLM 响应解析
@@ -127,6 +134,7 @@ def parse_and_clean_llm_response(llm_response: str) -> List[str]:
 			cleaned_entities.append(entity_name)
 	
 	return cleaned_entities
+
 
 # ================================================================
 # 数据类型定义区：与 TS interface 对应的结构类型
@@ -199,6 +207,7 @@ class EntityAlignResult(TypedDict):
 	"""
 	aligned_entity_names: List[str]
 	aligned_entity_fields: List[AlignedEntityResult]
+
 
 # ================================================================
 # 实体抽取器：LLM 从用户问题中抽取实体名称
@@ -276,6 +285,7 @@ class EntityExtractor:
 		except Exception as e:
 			self._logger.error(f"LLM提取实体名称报错:{e}", exc_info=True)
 			return []
+
 
 # ================================================================
 # 实体对齐器：实体名称在 Milvus 中的检索对齐
@@ -507,6 +517,7 @@ class EntityAligner:
 		
 		return results
 
+
 # ================================================================
 # 查询编排节点：实体抽取 → 实体对齐 → Neo4j 种子节点查询
 # ================================================================
@@ -602,7 +613,7 @@ class QueryKnowledgeGraphNode(BaseNode):
 		# 保证传递给Neo4j的是(item_name,entity_name)的参数对 因为存入Neo4j的时候key就是该参数对组成的 保证查询一体化
 		aligned_entity_names = entity_aligned_result.get("aligned_entity_names", [])
 		aligned_entity_fields = entity_aligned_result.get("aligned_entity_fields", [])
-	
+		
 		if not aligned_entity_names or not aligned_entity_fields:
 			self.logger.warning("没有可用的对齐实体，跳过 Neo4j 种子节点查询")
 			return
@@ -617,18 +628,20 @@ class QueryKnowledgeGraphNode(BaseNode):
 			item_name = seed_node["n.item_name"]
 			entity_name = seed_node["n.name"]
 			cleaned_seed_nodes.append({
-				"item_name":item_name,
-				"entity_name":entity_name
+				"item_name": item_name,
+				"entity_name": entity_name
 			})
 		self.log_step(step_name="STEP-5", message=f"查询到的种子节点为：{cleaned_seed_nodes}")
 		
 		# 5. 查询每个种子节点一跳范围内的所有实体节点和关系
 		one_hop_nodes = neo4j_graph_reader.query_one_hop_nodes(cleaned_seed_nodes)
 		self.log_step(step_name="STEP-6", message=f"查询到的种子节点在其一跳范围内的节点和关系为：{one_hop_nodes}")
-	
-		# 6. 对所有种子节点和一跳范围内的所有节点进行加权 种子2 邻居节点1
-		neo4j_graph_reader.collect_nodes_by_weight(cleaned_seed_nodes,one_hop_nodes)
 		
+		# 6. 对所有种子节点和一跳范围内的所有节点进行加权 种子2 邻居节点1
+		nodes_weight_list= neo4j_graph_reader.collect_nodes_by_weight(cleaned_seed_nodes, one_hop_nodes)
+		
+		# 7. 基于加权后的节点和MENTION_IN关系查询出所有关联的chunk_id
+		chunks_id_list  = neo4j_graph_reader.query_chunk_id_by_node_weight(nodes_weight_list)
 	@staticmethod
 	def get_neo4j_query_pairs(aligned_entity_fields: List[AlignedEntityResult]) -> List[Neo4jQueryPair]:
 		"""
@@ -663,6 +676,7 @@ class QueryKnowledgeGraphNode(BaseNode):
 		
 		return query_pairs
 
+
 # ================================================================
 # Neo4j 图查询器：种子节点的精确/模糊查询
 # ================================================================
@@ -691,12 +705,12 @@ class Neo4jGraphReader:
 	def __init__(self, config: QueryConfig):
 		self.logger = logging.getLogger(self.__class__.__name__)
 		self.database = config.neo4j_database
-		self._max_seed_candidates = config.kg_max_seed_candidates # 每个实体最大种子节点候选数
+		self._max_seed_candidates = config.kg_max_seed_candidates  # 每个实体最大种子节点候选数
 		self._max_total_seeds = config.kg_max_total_seeds  # 总种子节点上限
 		
-		self._max_triples_per_seed = config.kg_max_triples_per_seed # 每个种子最大三元组数
-		self._max_total_triples = config.kg_max_total_triples # 所有种子节点最大三元组数
-		
+		self._max_triples_per_seed = config.kg_max_triples_per_seed  # 每个种子最大三元组数
+		self._max_total_triples = config.kg_max_total_triples  # 所有种子节点最大三元组数
+		self._max_total_chunks = config.kg_max_total_chunks # 总切片上限
 		# 获取neo4j客户端及数据库
 		self.neo4j_driver = get_neo4j_client()
 		if self.neo4j_driver is None:
@@ -764,7 +778,7 @@ class Neo4jGraphReader:
 			self.logger.error(f"查询种子节点报错:{e}")
 		
 		return seed_nodes[:self._max_total_seeds]
-
+	
 	def query_one_hop_nodes(self, cleaned_seed_nodes: List[Neo4jQueryPair]) -> List[OneHopRelation]:
 		"""
 		从某个种子节点出发，查询其一跳范围内的所有邻居实体节点和关系。
@@ -846,7 +860,8 @@ class Neo4jGraphReader:
 			self.logger.error(f"查询种子节点的一跳范围内关系节点失败{e}")
 		return one_hop_results
 	
-	def collect_nodes_by_weight(self, cleaned_seed_nodes, one_hop_nodes):
+	def collect_nodes_by_weight(self, cleaned_seed_nodes: List[Neo4jQueryPair], one_hop_nodes: List[OneHopRelation]) -> \
+			List[Dict[str, Any]]:
 		"""
 		
 		Args:
@@ -857,7 +872,85 @@ class Neo4jGraphReader:
 
 		"""
 		
+		# 处理种子节点
+		if not cleaned_seed_nodes:
+			self.logger.warning("种子节点为空")
+		
+		nodes_weight_map = {}
+		for seed_node in cleaned_seed_nodes:
+			item_name = seed_node.get("item_name", "")
+			entity_name = seed_node.get("entity_name", "")
+			key = (item_name, entity_name)
+			if key not in nodes_weight_map:
+				nodes_weight_map[key] = SEED_NODE_WEIGHT
+		
+		if not one_hop_nodes:
+			self.logger.warning("一跳范围内节点为空")
+		
+		# 处理一跳范围内的邻居节点
+		for one_hop_node in one_hop_nodes:
+			item_name = one_hop_node.get("item_name", "")
+			head_entity_name = one_hop_node.get("head_entity_name", "")
+			tail_entity_name = one_hop_node.get("tail_entity_name", "")
+			
+			if head_entity_name and (item_name, head_entity_name) not in nodes_weight_map:
+				nodes_weight_map[(item_name, head_entity_name)] = NBR_NODE_WEIGHT
+			
+			if tail_entity_name and (item_name, tail_entity_name) not in nodes_weight_map:
+				nodes_weight_map[(item_name, tail_entity_name)] = NBR_NODE_WEIGHT
+		
+		# 返回格式化后的字典列表
+		return [
+			{
+				"item_name": item_name,
+				"entity_name": entity_name,
+				"weight": weight
+			}
+			for (item_name, entity_name), weight
+			in nodes_weight_map.items()
+		]
+	
+	def query_chunk_id_by_node_weight(self, nodes_weight_list):
+		"""
+		基于加权后的节点信息反查节点对应的chunk_id
+		Args:
+			nodes_weight_list:
 
+		Returns:
+
+		"""
+		if not nodes_weight_list:
+			self.logger.info("加权节点列表为空")
+			return []
+		
+		chunk_id_list = []
+		try:
+			chunk_results = self.neo4j_driver.execute_query(
+				database_=self.database,
+				query_="""
+				UNWIND $nodes_weight_list AS node_with_weight
+				MATCH (entity:ENTITY {name:node_with_weight.entity_name,item_name:node_with_weight.item_name})
+					  -[:MENTIONED_IN]-(chunk:CHUNK {item_name:node_with_weight.item_name})
+				WITH chunk,sum(node_with_weight.weight) AS total_score,count(entity) AS total_counts
+				RETURN chunk.chunk_id AS chunk_id,chunk.item_name AS item_name,total_score,total_counts
+				ORDER BY total_score DESC,total_counts DESC,chunk_id ASC
+				LIMIT $limit
+				""",
+				parameters_={
+					"limit": self._max_total_chunks
+				}
+			)
+			
+			
+			for chunk in chunk_results.records:
+				chunk_id = chunk.get("chunk_id","")
+				item_name = chunk.get("item_name", "")
+				total_score =  chunk.get("total_score", "")
+			
+			return []
+		except Exception as e:
+			self.logger.error(f"基于加权后的节点信息反查节点对应的chunk_id异常：{e}")
+		return chunk_id_list
 
 # ================================================================
 # 本地测试
