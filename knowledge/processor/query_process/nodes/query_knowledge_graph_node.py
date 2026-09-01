@@ -140,6 +140,29 @@ class Neo4jQueryPair(TypedDict):
 	entity_name: str
 
 
+class OneHopRelation(TypedDict):
+	"""
+	一跳关系三元组：种子节点到邻居实体的一条有向关系。
+
+	由 Neo4jGraphReader.query_one_hop_nodes 产出，对应图中
+	"(tail_entity_name)-[:relation]->(tail_entity_name)" 这条关系；
+	tail_entity_name/head_entity_name 的方向与图谱中箭头方向保持一致（通过 startNode(r) 判断）
+	item_name 用于唯一标识所属商品。
+
+	对应 TS 中形如的 interface：
+	interface OneHopRelation {
+		head_entity_name: string;       // 关系起点实体名（有向关系的箭头头部）
+		tail_entity_name: string;       // 关系终点实体名
+		item_name: string;  // 所属商品名
+		relation: string;   // 关系类型（如 MENTIONED_IN 已被过滤）
+	}
+	"""
+	head_entity_name: str
+	tail_entity_name: str
+	item_name: str
+	relation: str
+
+
 class AlignedEntityResult(TypedDict):
 	"""
 	单个实体名称的对齐结果（由 EntityAligner.align_by_one 产出，对应返回列表中的每个元素）。
@@ -563,25 +586,28 @@ class QueryKnowledgeGraphNode(BaseNode):
 		Returns:
 			None：结果通过修改 state 透出
 		"""
-		self.log_step(step_name="STEP-2", message="抽取实体名称")
+		self.log_step(step_name="STEP-2", message="开始基于用户问题从LLM中提取抽取实体名称")
 		# 1. 用户问题中抽取实体名称
 		entity_extractor = EntityExtractor()
 		cleaned_entities = entity_extractor.extract(rewritten_query)
+		self.log_step(step_name="STEP-2", message=f"基于用户问题从LLM中提取抽取实体名称:{cleaned_entities}")
 		
 		# 2. 基于抽取的实体名称和导入时存储在Milvus中的实体名称进行对齐
 		entity_aligner = EntityAligner()
+		self.log_step(step_name="STEP-3", message="基于LLM抽取实体名称在Milvus数据库中进行对齐")
 		entity_aligned_result = entity_aligner.align(cleaned_entities, item_names, query_config)
+		self.log_step(step_name="STEP-3", message=f"基于LLM抽取实体名称对齐结果为：{entity_aligned_result}")
 		
 		# 3. 基于对齐的实体名称及其信息进行格式化
 		# 保证传递给Neo4j的是(item_name,entity_name)的参数对 因为存入Neo4j的时候key就是该参数对组成的 保证查询一体化
 		aligned_entity_names = entity_aligned_result.get("aligned_entity_names", [])
 		aligned_entity_fields = entity_aligned_result.get("aligned_entity_fields", [])
 	
-		
 		if not aligned_entity_names or not aligned_entity_fields:
 			self.logger.warning("没有可用的对齐实体，跳过 Neo4j 种子节点查询")
 			return
 		query_pairs = self.get_neo4j_query_pairs(aligned_entity_fields)
+		self.log_step(step_name="STEP-4", message=f"传递给Neo4j中查询的参数对为：{query_pairs}")
 		
 		# 4. 基于查询信息在Neo4j知识图谱中查询种子节点
 		neo4j_graph_reader = Neo4jGraphReader(config=query_config)
@@ -594,10 +620,15 @@ class QueryKnowledgeGraphNode(BaseNode):
 				"item_name":item_name,
 				"entity_name":entity_name
 			})
+		self.log_step(step_name="STEP-5", message=f"查询到的种子节点为：{cleaned_seed_nodes}")
 		
-		self.logger.info(f"查询到的种子节点为:{cleaned_seed_nodes}")
-		
+		# 5. 查询每个种子节点一跳范围内的所有实体节点和关系
+		one_hop_nodes = neo4j_graph_reader.query_one_hop_nodes(cleaned_seed_nodes)
+		self.log_step(step_name="STEP-6", message=f"查询到的种子节点在其一跳范围内的节点和关系为：{one_hop_nodes}")
 	
+		# 6. 对所有种子节点和一跳范围内的所有节点进行加权 种子2 邻居节点1
+		neo4j_graph_reader.collect_nodes_by_weight(cleaned_seed_nodes,one_hop_nodes)
+		
 	@staticmethod
 	def get_neo4j_query_pairs(aligned_entity_fields: List[AlignedEntityResult]) -> List[Neo4jQueryPair]:
 		"""
@@ -660,8 +691,11 @@ class Neo4jGraphReader:
 	def __init__(self, config: QueryConfig):
 		self.logger = logging.getLogger(self.__class__.__name__)
 		self.database = config.neo4j_database
-		self._max_seed_candidates = config.kg_max_seed_candidates # 每个实体最大种子候选数
+		self._max_seed_candidates = config.kg_max_seed_candidates # 每个实体最大种子节点候选数
 		self._max_total_seeds = config.kg_max_total_seeds  # 总种子节点上限
+		
+		self._max_triples_per_seed = config.kg_max_triples_per_seed # 每个种子最大三元组数
+		self._max_total_triples = config.kg_max_total_triples # 所有种子节点最大三元组数
 		
 		# 获取neo4j客户端及数据库
 		self.neo4j_driver = get_neo4j_client()
@@ -730,6 +764,100 @@ class Neo4jGraphReader:
 			self.logger.error(f"查询种子节点报错:{e}")
 		
 		return seed_nodes[:self._max_total_seeds]
+
+	def query_one_hop_nodes(self, cleaned_seed_nodes: List[Neo4jQueryPair]) -> List[OneHopRelation]:
+		"""
+		从某个种子节点出发，查询其一跳范围内的所有邻居实体节点和关系。
+
+		1. 过滤 MENTIONED_IN 的关系节点（仅保留实体间关系）；
+		2. 双向查询：以种子结束和以种子开始都进行查询；
+		3. 记录 head 和 tail 方向，保证与图谱中箭头一致（startNode(r) 判断）；
+		4. 跨种子节点按 (item_name, head, tail, relation) 去重。
+
+		例如：
+		A种子节点 无向查询 A-B
+		B种子节点 无向查询 B-A
+
+		Args:
+			cleaned_seed_nodes: 对齐后的种子节点列表（(item_name, entity_name)）
+
+		Returns:
+			List[OneHopRelation]: 一跳关系三元组列表，数量上限为 _max_total_triples；
+			入参为空或查询异常时返回空列表
+		"""
+		one_hop_results: List[OneHopRelation] = []
+		if not cleaned_seed_nodes:
+			self.logger.error("种子节点数据不存在，无法查询其一跳节点")
+			return []
+		
+		try:
+			seen: set = set()
+			for seed_node in cleaned_seed_nodes:
+				entity_name = seed_node.get("entity_name", "")
+				item_name = seed_node.get("item_name")
+				seed_node_one_hoop_results = self.neo4j_driver.execute_query(
+					query_="""
+					MATCH (seed:ENTITY {item_name:$item_name,name:$entity_name})-[r]-(nbr:ENTITY)
+					WHERE type(r) <> "MENTIONED_IN" AND nbr.item_name = $item_name
+					RETURN
+						CASE
+							WHEN startNode(r) = seed THEN seed.name
+							ELSE nbr.name
+						END AS head,
+						type(r) AS relation,
+						CASE
+							WHEN startNode(r) = seed THEN nbr.name
+							ELSE seed.name
+						END AS tail
+					LIMIT $limit
+					""",
+					database_=self.database,
+					parameters_={
+						"entity_name": entity_name,
+						"item_name": item_name,
+						"limit": self._max_triples_per_seed
+					}
+				)
+				
+				# 遍历查询结果，统一转为 OneHopRelation 字典结构（不直接混入原始 Record）
+				for one_hop_record in seed_node_one_hoop_results.records:
+					head_entity_name = one_hop_record.get("head", "")
+					tail_entity_name = one_hop_record.get("tail", "")
+					relation = one_hop_record.get("relation", "")
+					
+					unique_key: tuple[str, str, str, str] = (
+						item_name,
+						head_entity_name,
+						tail_entity_name,
+						relation
+					)
+					
+					if unique_key not in seen:
+						seen.add(unique_key)
+						one_hop_results.append({
+							"head_entity_name": head_entity_name,
+							"tail_entity_name": tail_entity_name,
+							"item_name": item_name,
+							"relation": relation
+						})
+			
+			return one_hop_results[:self._max_total_triples]
+		except Exception as e:
+			self.logger.error(f"查询种子节点的一跳范围内关系节点失败{e}")
+		return one_hop_results
+	
+	def collect_nodes_by_weight(self, cleaned_seed_nodes, one_hop_nodes):
+		"""
+		
+		Args:
+			cleaned_seed_nodes:
+			one_hop_nodes:
+
+		Returns:
+
+		"""
+		
+
 
 # ================================================================
 # 本地测试

@@ -42,6 +42,12 @@ def get_llm_client(
 				"type": "json_object"
 			}
 		
+		# kimi-k3 模型的 temperature 固定为 1.0 不可修改，显式传入其他值会报
+		# invalid_request_error；传 None 让 langchain 序列化请求时跳过该字段，
+		# 由服务端使用默认值
+		if "kimi" in model_name.lower():
+			temperature = None
+		
 		llm_client = ChatOpenAI(
 			model=model_name,
 			temperature=temperature,
