@@ -475,6 +475,12 @@ class EntityAligner:
 				aligned_entity_name = aligned_result.get("aligned_entity_name", "")
 				item_name = aligned_result.get("item_name", "")
 				unique_key = (aligned_entity_name, item_name)
+				
+				# 对于检索分数太低或者检索为空的过滤
+				if not aligned_entity_name:
+					self._logger.info(f"实体名称{entity_name}检索分数太低或者检索为空")
+					continue
+				
 				if unique_key not in seen:
 					seen.add(unique_key)
 					aligned_entity_names.append(aligned_entity_name)
@@ -615,7 +621,8 @@ class EntityAligner:
 
 class QueryKnowledgeGraphNode(BaseNode):
 	"""
-	知识图谱查询节点（查询工作流中的一个图节点）。
+	知识图谱查询节点（查询工作流中的一个图节点）
+	主要是针对于精确的实体名称被LLM抽取匹配到的查询
 
 	职责：在查询阶段读取知识图谱，主要完成两件事——
 	1. 实体抽取：通过 EntityExtractor 用 LLM 从改写后的问题中抽取实体名称；
@@ -642,6 +649,12 @@ class QueryKnowledgeGraphNode(BaseNode):
 		
 		# 2. 知识图谱查询编排
 		pipeline_result = self.query_graph_pipeline(rewritten_query, item_names, query_config, state)
+		graph_chunks = pipeline_result.get("graph_chunks",[])
+		graph_relation_texts = pipeline_result.get("graph_relation_texts", [])
+		
+		# 3. 更新state节点
+		state["graph_chunks"] = graph_chunks
+		state["graph_relation_texts"] = graph_relation_texts
 		
 		return state
 	
@@ -715,7 +728,7 @@ class QueryKnowledgeGraphNode(BaseNode):
 		cleaned_seed_nodes = []
 		for seed_node in seed_nodes:
 			item_name = seed_node.get("item_name")
-			entity_name = seed_node.get("name")
+			entity_name = seed_node.get("entity_name")
 			cleaned_seed_nodes.append({
 				"item_name": item_name,
 				"entity_name": entity_name
@@ -857,7 +870,7 @@ class Neo4jGraphReader:
 				accurate_query_result = self.neo4j_driver.execute_query(
 					query_="""
 						MATCH (n:ENTITY {item_name:$item_name, name:$entity_name})
-						RETURN n.name, n.item_name
+						RETURN n.name AS entity_name, n.item_name AS item_name
 						""",
 					parameters_={
 						"entity_name": entity_name,
@@ -876,7 +889,7 @@ class Neo4jGraphReader:
 					query_="""
 						MATCH (n:ENTITY)
 						WHERE n.item_name = $item_name AND toLower(n.name) CONTAINS toLower($entity_name)
-						RETURN n.name, n.item_name
+						RETURN n.name AS entity_name, n.item_name AS item_name
 						LIMIT $limit
 						""",
 					parameters_={
@@ -1240,8 +1253,8 @@ if __name__ == "__main__":
 	setup_logging()
 	print("开始测试知识图谱查询节点")
 	_state: QueryGraphState = {
-		"rewritten_query": "H3C LA2608 室内无线网关怎么创建 WLAN-ESS 接口呢？",
-		"item_names": ["H3C LA2608 室内无线网关"]
+		"rewritten_query": "使用的时候如何保证个人信息和数据安全？",
+		"item_names": ["HUAWEI MateStation S 12代酷睿版"]
 	}
 	query_knowledge_node = QueryKnowledgeGraphNode()
 	_state = query_knowledge_node.process(_state)
