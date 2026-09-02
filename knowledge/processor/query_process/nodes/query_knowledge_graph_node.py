@@ -36,13 +36,14 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 from knowledge.processor.query_process.base import BaseNode
 from knowledge.processor.query_process.config import get_query_config, QueryConfig
-from knowledge.processor.query_process.exception import ValidationError, Neo4jError
+from knowledge.processor.query_process.exception import ValidationError, Neo4jError, MilvusError
 from knowledge.processor.query_process.state import QueryGraphState
 from knowledge.prompts.query_prompt import ENTITY_EXTRACT_SYSTEM_PROMPT
 from knowledge.utils.bge_m3_embedding_model import get_bge_m3_embedding_model, generate_hybrid_embeddings
 from knowledge.utils.llm_client import get_llm_client
 from knowledge.utils.log_config import setup_logging
-from knowledge.utils.milvus_client import create_hybrid_search_request, execute_hybrid_search, get_milvus_client
+from knowledge.utils.milvus_client import create_hybrid_search_request, execute_hybrid_search, get_milvus_client, \
+	query_chunks_by_chunk_id_list
 from knowledge.utils.neo4j_client import get_neo4j_client
 
 # ================================================================
@@ -644,7 +645,13 @@ class QueryKnowledgeGraphNode(BaseNode):
 		# 7. 基于加权后的节点和MENTION_IN关系查询出所有关联的chunk_id
 		chunk_nodes_sorted = neo4j_graph_reader.query_chunk_id_by_node_weight(nodes_weight_list)
 		self.log_step(step_name="STEP-8",
-		              message=f"基于加权后的实体字典分组排序查询到所有MENTION_IN到的CHUNK结果是：{group_by_score_hits}")
+		              message=f"基于加权后的实体字典分组排序查询到所有MENTION_IN到的CHUNK结果是：{chunk_nodes_sorted}")
+		
+		# 8. 从Neo4j中查询分组后排序的chunk去Milvus向量数据库的chunks表查询对应的chunk
+		chunk_back_filler = ChunkBackFiller(config=query_config)
+		chunk_results = chunk_back_filler.search_chunk_node_in_milvus(chunk_nodes_sorted)
+		self.log_step(step_name="STEP-9",
+		              message=f"：从Neo4j中查询分组后排序的chunk去Milvus向量数据库反查到的chunk是: {chunk_results}")
 	
 	@staticmethod
 	def get_neo4j_query_pairs(aligned_entity_fields: List[AlignedEntityResult]) -> List[Neo4jQueryPair]:
@@ -711,7 +718,6 @@ class Neo4jGraphReader:
 		self.database = config.neo4j_database
 		self._max_seed_candidates = config.kg_max_seed_candidates  # 每个实体最大种子节点候选数
 		self._max_total_seeds = config.kg_max_total_seeds  # 总种子节点上限
-		
 		self._max_triples_per_seed = config.kg_max_triples_per_seed  # 每个种子最大三元组数
 		self._max_total_triples = config.kg_max_total_triples  # 所有种子节点最大三元组数
 		self._max_total_chunks = config.kg_max_total_chunks  # 总切片上限
@@ -867,7 +873,9 @@ class Neo4jGraphReader:
 	def collect_nodes_by_weight(self, cleaned_seed_nodes: List[Neo4jQueryPair], one_hop_nodes: List[OneHopRelation]) -> \
 			List[Dict[str, Any]]:
 		"""
-		
+		权重固定：只看节点身份 是种子节点还是邻居节点（本项目使用）
+		权重累加：如果一个节点即是种子节点、又是邻居节点、或者在多条关系中反复出现，那么权重可以累加
+		🙋两者对比的实现方法、利弊和适用场景
 		Args:
 			cleaned_seed_nodes:
 			one_hop_nodes:
@@ -1030,7 +1038,7 @@ class Neo4jGraphReader:
 					id 设为 None 是因为 kg 这路不经过 Milvus 搜索没有主键。
 					Milvus查询返回的id是数据库中的主键ID自动生成的，source_chunk_id才是真正的
 					"""
-					group_by_score_hits.append({
+					chunk_nodes_sorted.append({
 						"id": "None",
 						"distance": float(total_score or 0.0),
 						"entity": {
@@ -1044,6 +1052,78 @@ class Neo4jGraphReader:
 			self.logger.error(f"基于加权后的节点信息反查节点对应的chunk_id异常：{e}")
 		
 		return chunk_nodes_sorted
+
+
+class ChunkBackFiller:
+	def __init__(self, config: QueryConfig):
+		self.logger = logging.getLogger(self.__class__.__name__)
+		self.milvus_client = get_milvus_client()
+		self.config = config
+		if self.milvus_client is None:
+			raise MilvusError(node_name="ChunkBackFiller查询类", message="Milvus客户端连接失败")
+	
+	def search_chunk_node_in_milvus(self, chunk_nodes_sorted: List[Dict[str, Any]]):
+		"""
+		根据上一步反查到的 chunk_id 列表，从 Milvus CHUNKS_COLLECTION 批量回填切片文本内容
+		Args:
+			chunk_nodes_sorted:
+
+		Returns:
+
+		"""
+		
+		# 获取chunk id列表
+		if not chunk_nodes_sorted:
+			return []
+		chunk_id_list = []
+		for chunk in chunk_nodes_sorted:
+			entity = chunk.get("entity", {})
+			chunk_id = str(entity.get('chunk_id', ""))
+			if not chunk_id:
+				continue
+			try:
+				chunk_id_list.append(int(chunk_id))
+			except (ValueError, TypeError):
+				chunk_id_list.append(chunk_id)
+		
+		self.logger.info(f"chunk_id 列表:{chunk_id_list}")
+		
+		if not chunk_id_list:
+			return []
+		
+		# 查询Milvus数据库
+		chunk_rows = query_chunks_by_chunk_id_list(
+			milvus_client=self.milvus_client,
+			collection_name=self.config.chunks_collection,
+			chunk_id_list=chunk_id_list,
+			output_fields=[
+				"chunk_id",
+				"item_name",
+				"content",
+				"file_title",
+			]
+		)
+		
+		# 建立chunk_id to chunk_row的映射表
+		chunk_id_to_row_map = {}
+		for chunk_row in chunk_rows:
+			chunk_id = chunk_row.get("chunk_id")
+			chunk_id_to_row_map[chunk_id] = chunk_row
+		
+		# 因为Milvus基于主键ids查询的结果和向量查询的结果不同 不包含distance的排序结果
+		# 因此需要按照chunk_nodes_sorted的顺序进行二次排序
+		# 排序后最靠前的chunk保证和Neo4j中查询出来的权重最高的顺序一致
+		chunk_results = []
+		for sorted_chunk_node in chunk_nodes_sorted:
+			entity = sorted_chunk_node.get("entity", {})
+			chunk_id = entity.get("chunk_id", "")
+			chunk = chunk_id_to_row_map.get(chunk_id)
+			
+			if chunk is None:
+				continue
+			chunk_results.append(chunk)
+		
+		return chunk_results
 
 
 # ================================================================

@@ -11,7 +11,6 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=INFO)
 load_dotenv(override=True)
 
-
 # Milvus 连接地址
 # MILVUS_URL = http://localhost:19530
 # 知识库切片集合名
@@ -44,16 +43,16 @@ def get_milvus_client(uri: str = "") -> Optional[MilvusClient]:
 	"""
 	try:
 		global milvus_client
-
+		
 		if milvus_client is not None and isinstance(milvus_client, MilvusClient):
 			return milvus_client
-
+		
 		milvus_server_uri = uri or os.getenv("MILVUS_URL")
-
+		
 		milvus_client = MilvusClient(
 			uri=milvus_server_uri
 		)
-
+		
 		return milvus_client
 	except Exception as e:
 		logger.error(f"创建Milvus客户端报错: {e}")
@@ -92,12 +91,12 @@ def create_hybrid_search_request(
 		dense_params = {
 			"metric_type": "COSINE"
 		}
-
+	
 	if sparse_params is None:
 		sparse_params = {
 			"metric_type": "IP"
 		}
-
+	
 	# 稠密向量检索器
 	dense_req = AnnSearchRequest(
 		data=[dense_vector],
@@ -107,7 +106,7 @@ def create_hybrid_search_request(
 		expr_params=expr_params,
 		limit=limit
 	)
-
+	
 	# 稀疏向量检索器
 	sparse_req = AnnSearchRequest(
 		data=[sparse_vector],
@@ -156,10 +155,10 @@ def execute_hybrid_search(
 			ranker_weights[1],
 			norm_score=norm_score
 		)
-
+		
 		if output_fields is None:
 			output_fields = ["text", "id"]
-
+		
 		search_result = milvus_client.hybrid_search(
 			collection_name=collection_name,
 			reqs=reqs,
@@ -167,12 +166,43 @@ def execute_hybrid_search(
 			limit=limit,
 			output_fields=output_fields,
 		)
-
+		
 		total_hits = sum(len(hit) for hit in search_result) if search_result else 0
 		logger.info(f"执行混合检索成功,总计处理{len(search_result) if search_result else 0}次查询")
 		logger.info(f"\n 总计召回{total_hits}个查询结果")
-
+		
 		return search_result
 	except Exception as e:
 		logger.error(f"执行混合检索报错: {e}")
 		return None
+
+
+def query_chunks_by_chunk_id_list(
+		milvus_client: MilvusClient,
+		collection_name: str,
+		chunk_id_list: List[str],
+		output_fields: List[str]
+):
+	"""
+	
+	Args:
+	    milvus_client:
+		collection_name:
+		chunk_id_list:
+		output_fields:
+
+	Returns:
+
+	"""
+	try:
+		milvus_client.load_collection(collection_name)
+		rows = milvus_client.query(
+			collection_name=collection_name,
+			output_fields=output_fields,
+			ids=chunk_id_list,
+		)
+		return rows
+	except Exception as e:
+		logger.error(f"基于chunk id列表查询chunk异常: {e}")
+		return []
+	
