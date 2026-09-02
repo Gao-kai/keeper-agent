@@ -638,10 +638,14 @@ class QueryKnowledgeGraphNode(BaseNode):
 		self.log_step(step_name="STEP-6", message=f"查询到的种子节点在其一跳范围内的节点和关系为：{one_hop_nodes}")
 		
 		# 6. 对所有种子节点和一跳范围内的所有节点进行加权 种子2 邻居节点1
-		nodes_weight_list= neo4j_graph_reader.collect_nodes_by_weight(cleaned_seed_nodes, one_hop_nodes)
+		nodes_weight_list = neo4j_graph_reader.collect_nodes_by_weight(cleaned_seed_nodes, one_hop_nodes)
+		self.log_step(step_name="STEP-7", message=f"对种子节点和一跳节点加权后的字典：{nodes_weight_list}")
 		
 		# 7. 基于加权后的节点和MENTION_IN关系查询出所有关联的chunk_id
-		chunks_id_list  = neo4j_graph_reader.query_chunk_id_by_node_weight(nodes_weight_list)
+		chunk_nodes_sorted = neo4j_graph_reader.query_chunk_id_by_node_weight(nodes_weight_list)
+		self.log_step(step_name="STEP-8",
+		              message=f"基于加权后的实体字典分组排序查询到所有MENTION_IN到的CHUNK结果是：{group_by_score_hits}")
+	
 	@staticmethod
 	def get_neo4j_query_pairs(aligned_entity_fields: List[AlignedEntityResult]) -> List[Neo4jQueryPair]:
 		"""
@@ -710,7 +714,7 @@ class Neo4jGraphReader:
 		
 		self._max_triples_per_seed = config.kg_max_triples_per_seed  # 每个种子最大三元组数
 		self._max_total_triples = config.kg_max_total_triples  # 所有种子节点最大三元组数
-		self._max_total_chunks = config.kg_max_total_chunks # 总切片上限
+		self._max_total_chunks = config.kg_max_total_chunks  # 总切片上限
 		# 获取neo4j客户端及数据库
 		self.neo4j_driver = get_neo4j_client()
 		if self.neo4j_driver is None:
@@ -971,9 +975,10 @@ class Neo4jGraphReader:
 			self.logger.info("加权节点列表为空")
 			return []
 		
-		chunk_id_list = []
+		chunk_nodes_sorted = []
+		
 		try:
-			chunk_results = self.neo4j_driver.execute_query(
+			group_by_score_hits = self.neo4j_driver.execute_query(
 				database_=self.database,
 				query_="""
 				UNWIND $nodes_weight_list AS node_with_weight
@@ -986,20 +991,60 @@ class Neo4jGraphReader:
 				""",
 				parameters_={
 					"limit": self._max_total_chunks,
-					"nodes_weight_list":nodes_weight_list
+					"nodes_weight_list": nodes_weight_list
 				}
 			)
 			
+			"""
+			加权之后假设有3个ENTITY节点
+			A 2 A总计有5个chunk MENTIONED_IN 比如是CHUNK 12345
+			B 2 B总计有3个chunk MENTIONED_IN 比如是CHUNK 12
+			C 1 C总计有2个chunk MENTIONED_IN 比如是CHUNK 35
 			
-			for chunk in chunk_results.records:
-				chunk_id = chunk.get("chunk_id","")
-				item_name = chunk.get("item_name", "")
-				total_score =  chunk.get("total_score", "")
+			按照chunk进行分组WITH(ORDER BY)
+			对于chunk 1来说 AB两个ENTITY命中 权重累计是4 次数是2
+			对于chunk 2来说 AB两个ENTITY命中 权重累计是4 次数是2
+			对于chunk 3来说 BC两个ENTITY命中 权重累计是3 次数是2
+			对于chunk 4来说 A一个ENTITY命中 权重累计是2 次数是1
+			对于chunk 5来说 AC两个ENTITY命中 权重累计是3 次数是2
 			
-			return []
+			最后排序：
+			得分最高的权重是4
+			提及次数最多的是2
+			最终排序：
+			chunk1 返回chunk1的id chunk1的item_name商品名、该组总得分权重累计4、提及总次数2（数据会汇总在一个Record中）
+			chunk2
+			chunk5
+			chunk3
+			chunk4
+			
+			"""
+			for record in group_by_score_hits.records:
+				chunk_id = record.get("chunk_id", "")
+				item_name = record.get("item_name", "")
+				total_score = record.get("total_score", "")
+				if chunk_id and item_name:
+					"""
+					向量检索（embedding_chunks）和 HyDE 检索（hyde_embedding_chunks）从 Milvus hybrid_search 返回的结构也是这样的。
+					保持三路来源格式统一，RRF 节点不需要做特殊处理就能直接消费。
+					id 设为 None 是因为 kg 这路不经过 Milvus 搜索没有主键。
+					Milvus查询返回的id是数据库中的主键ID自动生成的，source_chunk_id才是真正的
+					"""
+					group_by_score_hits.append({
+						"id": "None",
+						"distance": float(total_score or 0.0),
+						"entity": {
+							"chunk_id": str(chunk_id),
+							"item_name": str(item_name)
+						}
+						
+					})
+		
 		except Exception as e:
 			self.logger.error(f"基于加权后的节点信息反查节点对应的chunk_id异常：{e}")
-		return chunk_id_list
+		
+		return chunk_nodes_sorted
+
 
 # ================================================================
 # 本地测试
