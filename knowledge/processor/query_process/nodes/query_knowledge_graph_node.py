@@ -30,7 +30,7 @@ chunk_id 关联到 Entity         ←对应→     根据 chunk_id 从 Milvus �
 import json
 import logging
 import re
-from typing import List, Dict, Any, Set, Optional, NotRequired, TypedDict, Tuple
+from typing import List, Dict, Any, Set, Optional, NotRequired, TypedDict, cast
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -136,7 +136,6 @@ def parse_and_clean_llm_response(llm_response: str) -> List[str]:
 	
 	return cleaned_entities
 
-
 # ================================================================
 # 数据类型定义区：与 TS interface 对应的结构类型
 # ================================================================
@@ -208,6 +207,95 @@ class EntityAlignResult(TypedDict):
 	"""
 	aligned_entity_names: List[str]
 	aligned_entity_fields: List[AlignedEntityResult]
+
+
+class MilvusChunkRow(TypedDict):
+	"""
+	从 Milvus chunks 集合按主键批量查询出的单行切片数据。
+
+	由 ChunkBackFiller.search_chunk_node_in_milvus 产出（output_fields 决定返回哪些标量字段），
+	即 query_graph_pipeline 返回结果中 chunks 列表的元素。
+
+	对应 TS 中形如的 interface：
+	interface MilvusChunkRow {
+		chunk_id: number;    // Milvus 主键（INT64 auto_id 自增生成）
+		item_name: string;   // 所属商品名
+		content: string;     // 切片正文
+		file_title: string;  // 来源文件名
+		// 还可包含 Milvus 返回的其他标量字段（以调用方传入的 output_fields 为准）
+	}
+	"""
+	chunk_id: int
+	item_name: str
+	content: str
+	file_title: str
+
+
+# Neo4j 种子节点
+class Neo4jSeedRecord(TypedDict):
+	item_name: str
+	entity_name: str
+
+
+class QueryGraphPipelineResult(TypedDict):
+	"""
+	query_graph_pipeline 的返回结果：整条图谱查询编排链路的最终产出，
+	即 QueryKnowledgeGraphNode 图谱查询阶段交给下游（RRF 混合融合、答案生成 prompt、会话状态）的数据契约。
+
+	对应 TS 中形如的 interface：
+	interface QueryGraphPipelineResult {
+		graph_chunks: MilvusChunkRow[];           // 按权重排序回填后的切片文本 → 送入 RRF 参与混合检索融合
+		graph_relation_texts: string[];           // 一跳关系文本描述（形如 "A -[关系]-> B"）→ 送入答案生成 prompt
+		seed_nodes: Neo4jSeedRecord[];      // Neo4j 精确/模糊命中的种子节点原始记录（列名 n.name / n.item_name）
+		one_hop_nodes: OneHopRelation[];    // 种子节点一跳范围内的三元组（head/tail 方向与关系类型）
+		llm_extract_entities: string[];     // LLM 从用户问题中抽取的实体名（清洗去重后）
+		aligned_entity_names: string[];     // 对齐成功的规范实体名
+		aligned_entity_fields: AlignedEntityResult[];  // 每个实体的对齐详情（得分/来源 chunk/上下文等）
+	}
+	"""
+	graph_chunks: List[MilvusChunkRow]
+	graph_relation_texts: List[str]
+	seed_nodes: List[Neo4jSeedRecord]
+	one_hop_nodes: List[OneHopRelation]
+	llm_extract_entities: List[str]
+	aligned_entity_names: List[str]
+	aligned_entity_fields: List[AlignedEntityResult]
+
+
+def transform_one_hop_nodes_to_text(one_hop_nodes: List[OneHopRelation]) -> List[str]:
+	"""
+	将一跳关系三元组列表转换为便于 LLM 理解的自然语言文本描述。
+
+	每条三元组格式化为 "item_name head -[relation]-> tail"（无 item_name 时省略前缀），
+	跳过字段不全的脏数据。
+
+	Args:
+		one_hop_nodes: 一跳关系三元组列表（元素为 OneHopRelation，
+			含 head_entity_name/tail_entity_name/item_name/relation）
+
+	Returns:
+		List[str]: 关系文本描述列表；入参为空或全部为脏数据时返回空列表
+	"""
+	if not one_hop_nodes:
+		return []
+	
+	relation_texts: List[str] = []
+	for one_hop_node in one_hop_nodes:
+		head_entity_name = one_hop_node.get("head_entity_name")
+		tail_entity_name = one_hop_node.get("tail_entity_name")
+		item_name = one_hop_node.get("item_name")
+		relation = one_hop_node.get("relation")
+		
+		# 脏数据过滤：head/tail/relation 任一缺失则跳过该条三元组
+		if not (head_entity_name and tail_entity_name and relation):
+			continue
+		
+		if not item_name:
+			relation_texts.append(f"{head_entity_name} -({relation})-> {tail_entity_name}")
+		else:
+			relation_texts.append(f"{item_name} {head_entity_name} -({relation})-> {tail_entity_name}")
+	
+	return relation_texts
 
 
 # ================================================================
@@ -522,6 +610,9 @@ class EntityAligner:
 # ================================================================
 # 查询编排节点：实体抽取 → 实体对齐 → Neo4j 种子节点查询
 # ================================================================
+
+
+
 class QueryKnowledgeGraphNode(BaseNode):
 	"""
 	知识图谱查询节点（查询工作流中的一个图节点）。
@@ -550,7 +641,7 @@ class QueryKnowledgeGraphNode(BaseNode):
 		item_names, rewritten_query = self.validate_inputs(state)
 		
 		# 2. 知识图谱查询编排
-		self.query_graph_pipeline(rewritten_query, item_names, query_config, state)
+		pipeline_result = self.query_graph_pipeline(rewritten_query, item_names, query_config, state)
 		
 		return state
 	
@@ -578,7 +669,8 @@ class QueryKnowledgeGraphNode(BaseNode):
 		
 		return item_names, rewritten_query
 	
-	def query_graph_pipeline(self, rewritten_query, item_names, query_config, state):
+	def query_graph_pipeline(self, rewritten_query, item_names, query_config,
+                         state) -> QueryGraphPipelineResult:
 		"""
 		知识图谱查询编排主流程。
 
@@ -614,10 +706,6 @@ class QueryKnowledgeGraphNode(BaseNode):
 		# 保证传递给Neo4j的是(item_name,entity_name)的参数对 因为存入Neo4j的时候key就是该参数对组成的 保证查询一体化
 		aligned_entity_names = entity_aligned_result.get("aligned_entity_names", [])
 		aligned_entity_fields = entity_aligned_result.get("aligned_entity_fields", [])
-		
-		if not aligned_entity_names or not aligned_entity_fields:
-			self.logger.warning("没有可用的对齐实体，跳过 Neo4j 种子节点查询")
-			return
 		query_pairs = self.get_neo4j_query_pairs(aligned_entity_fields)
 		self.log_step(step_name="STEP-4", message=f"传递给Neo4j中查询的参数对为：{query_pairs}")
 		
@@ -626,8 +714,8 @@ class QueryKnowledgeGraphNode(BaseNode):
 		seed_nodes = neo4j_graph_reader.find_seed_nodes(query_pairs)
 		cleaned_seed_nodes = []
 		for seed_node in seed_nodes:
-			item_name = seed_node["n.item_name"]
-			entity_name = seed_node["n.name"]
+			item_name = seed_node.get("item_name")
+			entity_name = seed_node.get("name")
 			cleaned_seed_nodes.append({
 				"item_name": item_name,
 				"entity_name": entity_name
@@ -652,6 +740,23 @@ class QueryKnowledgeGraphNode(BaseNode):
 		chunk_results = chunk_back_filler.search_chunk_node_in_milvus(chunk_nodes_sorted)
 		self.log_step(step_name="STEP-9",
 		              message=f"：从Neo4j中查询分组后排序的chunk去Milvus向量数据库反查到的chunk是: {chunk_results}")
+		
+		# 9. 将一跳范围内的所有三元组转化为文本结构拼接 方便大模型知道节点之间的关系
+		relation_texts = transform_one_hop_nodes_to_text(one_hop_nodes)
+		
+		# 返回：通过 cast 断言字典字面量符合 QueryGraphPipelineResult 结构
+		# （边界值 chunk_results/seed_nodes 源于 Milvus 行 dict 与 Neo4j Record，
+		#  运行时形状与 TypedDict 定义一致，但静态类型上并非 TypedDict 实例，故显式断言）
+		return {
+			"graph_chunks": chunk_results,  # 回填后的切片文本 → 送入 RRF
+			"graph_relation_texts": relation_texts,  # 关系文本描述 → 送入答案生成 prompt
+			"seed_nodes": cleaned_seed_nodes,
+			"one_hop_nodes": one_hop_nodes,
+			"llm_extract_entities": cleaned_entities,
+			"aligned_entity_names": aligned_entity_names,
+			"aligned_entity_fields": aligned_entity_fields,
+		}
+	
 	
 	@staticmethod
 	def get_neo4j_query_pairs(aligned_entity_fields: List[AlignedEntityResult]) -> List[Neo4jQueryPair]:
@@ -1064,7 +1169,9 @@ class ChunkBackFiller:
 	
 	def search_chunk_node_in_milvus(self, chunk_nodes_sorted: List[Dict[str, Any]]):
 		"""
-		根据上一步反查到的 chunk_id 列表，从 Milvus CHUNKS_COLLECTION 批量回填切片文本内容
+		根据上一步反查到的 chunk_id 列表
+		从 Milvus CHUNKS_COLLECTION 批量回填切片文本内容
+		
 		Args:
 			chunk_nodes_sorted:
 
@@ -1108,7 +1215,7 @@ class ChunkBackFiller:
 		chunk_id_to_row_map = {}
 		for chunk_row in chunk_rows:
 			chunk_id = chunk_row.get("chunk_id")
-			chunk_id_to_row_map[chunk_id] = chunk_row
+			chunk_id_to_row_map[str(chunk_id)] = chunk_row
 		
 		# 因为Milvus基于主键ids查询的结果和向量查询的结果不同 不包含distance的排序结果
 		# 因此需要按照chunk_nodes_sorted的顺序进行二次排序
@@ -1116,7 +1223,7 @@ class ChunkBackFiller:
 		chunk_results = []
 		for sorted_chunk_node in chunk_nodes_sorted:
 			entity = sorted_chunk_node.get("entity", {})
-			chunk_id = entity.get("chunk_id", "")
+			chunk_id = str(entity.get("chunk_id", ""))
 			chunk = chunk_id_to_row_map.get(chunk_id)
 			
 			if chunk is None:

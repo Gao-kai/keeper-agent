@@ -181,27 +181,64 @@ def query_chunks_by_chunk_id_list(
 		milvus_client: MilvusClient,
 		collection_name: str,
 		chunk_id_list: List[str],
-		output_fields: List[str]
+		output_fields: List[str],
+		batch_size: int = 100
 ):
 	"""
-	
+	基于 chunk_id 列表批量查询 chunk 数据行。
+
+	为避免单次请求过大（触发 Milvus/网络层限制），将 chunk_id_list 按 batch_size
+	（默认 100 个一批）切分成多个批次，逐批调用 milvus_client.query(ids=...)，
+	最后按批次顺序合并所有查询结果返回。
+
+	注意：chunks 集合主键 chunk_id 为 INT64（auto_id 自增生成），
+	而调用方传入的可能是字符串形式的数字（如图谱侧回填的 str(id)），
+	因此函数内部会把可转 int 的 id 统一转成 int 再查询；
+	不可转换的非数字 id（如临时 id "temp_chunk_3"）不可能存在于 Milvus 中，跳过并告警。
+	结果行不保证与 chunk_id_list 的输入顺序一一对应（Milvus 按主键返回，
+	如需保序请调用方自行按输入顺序重排）。
+
 	Args:
-	    milvus_client:
-		collection_name:
-		chunk_id_list:
-		output_fields:
+		milvus_client: Milvus 客户端实例
+		collection_name: 目标集合名称（chunks 集合）
+		chunk_id_list: chunk_id 列表，元素可为 int 或数字字符串；为空直接返回 []
+		output_fields: 需要返回的标量字段列表，如 ["chunk_id", "item_name", "content"]
+		batch_size: 每批查询的 id 数量，默认 100
 
 	Returns:
-
+		List[dict]: 所有批次合并后的查询结果行；
+			查询异常时记录错误日志并返回 []（不存在的 id 不会报错，只是不出现在结果中）
 	"""
 	try:
+		# 主键为 INT64，统一转成 int；非数字 id 不可能命中主键，跳过并告警
+		parsed_ids = []
+		for chunk_id in chunk_id_list:
+			try:
+				parsed_ids.append(int(chunk_id))
+			except (ValueError, TypeError):
+				logger.warning(f"基于chunk id查询chunk时跳过无法转int的id: {chunk_id}")
+
+		if not parsed_ids:
+			return []
+
+		# 查询前先加载集合（幂等操作，重复调用无副作用）
 		milvus_client.load_collection(collection_name)
-		rows = milvus_client.query(
-			collection_name=collection_name,
-			output_fields=output_fields,
-			ids=chunk_id_list,
-		)
-		return rows
+
+		# 按 batch_size 分批查询并合并结果
+		all_rows = []
+		for i in range(0, len(parsed_ids), batch_size):
+			batch_ids = parsed_ids[i:i + batch_size]
+			rows = milvus_client.query(
+				collection_name=collection_name,
+				output_fields=output_fields,
+				ids=batch_ids,
+			)
+			if rows:
+				all_rows.extend(rows)
+
+		logger.info(f"基于chunk id查询chunk完成: 共请求{len(chunk_id_list)}个id,"
+		            f"分{ (len(parsed_ids) + batch_size - 1) // batch_size}批,实际返回{len(all_rows)}行")
+		return all_rows
 	except Exception as e:
 		logger.error(f"基于chunk id列表查询chunk异常: {e}")
 		return []

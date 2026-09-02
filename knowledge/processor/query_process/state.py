@@ -29,8 +29,8 @@ class QueryGraphState(TypedDict,total=False):
         rewritten_query: 重写后的查询。
         history: 历史对话列表。
         is_stream: 是否启用流式输出。
-        kg_chunks: 知识图谱相关切片列表。
-        kg_triples: 知识图谱三元组列表。
+        graph_chunks: 知识图谱相关切片列表。
+        graph_relation_texts: 知识图谱三元组列表。
     """
 
     session_id: str
@@ -47,8 +47,8 @@ class QueryGraphState(TypedDict,total=False):
     rewritten_query: str
     history: list
     is_stream: bool
-    kg_chunks: list
-    kg_triples: list
+    graph_chunks: list
+    graph_relation_texts: list
 
 
 # ==================== 默认状态 ====================
@@ -68,8 +68,8 @@ QUERY_GRAPH_DEFAULT_STATE: QueryGraphState = {
     "rewritten_query": "",          # 重写查询
     "history": [],                  # 历史对话
     "is_stream": False,             # 是否流式输出
-    "kg_chunks": [],                # 知识图谱切片
-    "kg_triples": []                # 知识图谱关系
+    "graph_chunks": [],                # 知识图谱切片
+    "graph_relation_texts": []                # 知识图谱关系
 }
 
 
