@@ -1253,7 +1253,7 @@ if __name__ == "__main__":
 	setup_logging()
 	print("开始测试知识图谱查询节点")
 	_state: QueryGraphState = {
-		"rewritten_query": "使用的时候如何保证个人信息和数据安全？",
+		"rewritten_query": "使用的时候如何保证电池安全使用呢？",
 		"item_names": ["HUAWEI MateStation S 12代酷睿版"]
 	}
 	query_knowledge_node = QueryKnowledgeGraphNode()
