@@ -95,8 +95,8 @@ if __name__ == '__main__':
 	setup_logging()
 	print("开始测试查询节点-向量混合检索节点")
 	state = {
-		"rewritten_query":"H3C LA2608 室内无线网关怎么创建 WLAN-ESS 接口呢？",
-		"item_names": ["H3C LA2608 室内无线网关"]
+		"rewritten_query":"HUAWEI MateStation12电脑使用电源有哪些需要注意的安全点？",
+		"item_names": ["HUAWEI MateStation S 12代酷睿版"]
 	}
 	hybridVectorSearchNode = HybridVectorSearchNode()
 	state = hybridVectorSearchNode.process(state)

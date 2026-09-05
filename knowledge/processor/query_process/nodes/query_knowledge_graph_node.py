@@ -1241,7 +1241,7 @@ class ChunkBackFiller:
 			
 			if chunk is None:
 				continue
-			chunk_results.append(chunk)
+			chunk_results.append({"entity":chunk})
 		
 		return chunk_results
 
@@ -1252,10 +1252,10 @@ class ChunkBackFiller:
 if __name__ == "__main__":
 	setup_logging()
 	print("开始测试知识图谱查询节点")
-	_state: QueryGraphState = {
-		"rewritten_query": "使用的时候如何保证电池安全使用呢？",
+	state = {
+		"rewritten_query":"HUAWEI MateStation12电脑使用电源有哪些需要注意的安全点？",
 		"item_names": ["HUAWEI MateStation S 12代酷睿版"]
 	}
 	query_knowledge_node = QueryKnowledgeGraphNode()
-	_state = query_knowledge_node.process(_state)
+	_state = query_knowledge_node.process(state)
 	print(_state)
