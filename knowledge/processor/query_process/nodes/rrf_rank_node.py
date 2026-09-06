@@ -115,6 +115,7 @@ RRF 是一种简单而有效的"投票式"融合策略——**在多个检索列
 它特别适合需要快速部署、缺乏标注数据、或需要融合异构检索系统的场景。
 当有标注数据可用时，可以考虑更精细的分数加权融合方法来进一步提升效果。
 """
+
 from typing import TypedDict, Tuple, List, Dict, Any
 
 from knowledge.processor.query_process.base import BaseNode
@@ -122,188 +123,250 @@ from knowledge.processor.query_process.config import get_query_config
 from knowledge.processor.query_process.state import QueryGraphState
 from knowledge.utils.log_config import setup_logging
 
+# 本节点在查询流程中的位置：
+#   知识图谱路(graph_chunks) / 向量检索路(embedding_chunks) / HyDE 路(hyde_embedding_chunks)
+#                                    ↓ 三路结果汇总
+#                          RRFRankNode（本文件，加权 RRF 倒数排名融合）
+#                                    ↓ state["rrf_chunks"]
+#                        下游 Rerank 节点 / 提示词构造节点
+
 
 class MilvusSearchHit(TypedDict):
-	id: int
-	distance: float
-	entity: Dict[str,Any]
+    """Milvus 混合检索返回的原始命中记录（仅用于类型标注与阅读参考）。
+
+    Attributes:
+            id: Milvus 主键。本节点不使用它，切片业务 ID 一律取 entity 内的 chunk_id。
+            distance: 该路检索给出的相似度分数。
+                    注意：RRF 只使用“排名位置”，因此本节点全程不会读取该分数。
+            entity: 切片数据载体，至少包含 chunk_id / content / item_name 等字段。
+    """
+
+    id: int
+    distance: float
+    entity: Dict[str, Any]
 
 
 # 单路检索结果：(标准化后的切片 entity 列表, 该路参与 RRF 融合的权重)
-WeightedChunks = Tuple[List[Dict[str,Any]], float]
+WeightedChunks = Tuple[List[Dict[str, Any]], float]
 
 
 class WeightedChunkMap(TypedDict):
-	"""
-	collect_normalize_chunk_entity 的返回值：三路检索结果归一化后按来源分组，
-	每组为 (切片 entity 列表, 该路权重) 的二元组。
+    """
+    collect_normalize_chunk_entity 的返回值：三路检索结果归一化后按来源分组，
+    每组为 (切片 entity 列表, 该路权重) 的二元组。
 
-	权重含义：图谱路与向量检索路为 1.0（等权），HyDE 路为 0.7（假设答案噪声较大，降权）。
-	"""
-	graph_chunks_weighted: WeightedChunks
-	embedding_chunks_weighted: WeightedChunks
-	hyde_embedding_chunks_weighted: WeightedChunks
+    权重含义：图谱路与向量检索路为 1.0（等权），HyDE 路为 0.7（假设答案噪声较大，降权）。
+    """
+
+    graph_chunks_weighted: WeightedChunks  # 知识图谱路，权重 1.0
+    embedding_chunks_weighted: WeightedChunks  # 原始查询向量检索路，权重 1.0
+    hyde_embedding_chunks_weighted: WeightedChunks  # HyDE 假设答案检索路，权重 0.7
 
 
 class RRFRankNode(BaseNode):
-	"""
-	希望头部排名为主 K比较小
-	希望头部排名为辅 综合其它排名 K比较大
-	"""
-	
-	
-	
-	def process(self, state: QueryGraphState) -> QueryGraphState:
-		config = get_query_config()
-		
-		# 1. 收集并格式化三路检索的结果
-		chunks_weighted_map = self.collect_normalize_chunk_entity(state)
-		self.logger.info(
-			f"RRF 输入: "
-			f"向量检索={len(chunks_weighted_map['embedding_chunks_weighted'][0])}条, "
-			f"HyDE检索={len(chunks_weighted_map['hyde_embedding_chunks_weighted'][0])}条, "
-			f"知识图谱={len(chunks_weighted_map['graph_chunks_weighted'][0])}条"
-		)
-		
-		# 2. 提取三路结果和权重
-		rrf_inputs = list(chunks_weighted_map.values())
-		
-		# 2. 将三路结果进行RRF融合排序
-		rrf_merge_results = self.merge_rrf_inputs(rrf_inputs,config.rrf_k,config.rrf_max_results)
-		
-		# 3. 获取RRF排序结果 不要分数 只要chunk
-		rrf_chunks = []
-		for rrf_merge_result in rrf_merge_results:
-			chunk =rrf_merge_result[0]
-			rrf_chunks.append(chunk)
-			
-		# 4. 获取分数的最大和最小范围
-		scores = []
-		for rrf_merge_result in rrf_merge_results:
-			score = rrf_merge_result[1]
-			scores.append(score)
-		self.logger.info(f"RRF融合排序后的最大分:{max(scores):.6f}")
-		self.logger.info(f"RRF融合排序后的最小分:{min(scores):.6f}")
-		
-		# 5. 更新state
-		state["rrf_chunks"] = rrf_chunks
-		
-		return state
-	
-	def collect_normalize_chunk_entity(self, state) -> WeightedChunkMap:
-		"""
-		收集三路检索的结果chunks
-		统一格式化为相同的数据结构并且为每一路配置不同的权重
-		Args:
-			state:
+    """
+    希望头部排名为主 K比较小
+    希望头部排名为辅 综合其它排名 K比较大
 
-		Returns:
-			WeightedChunkMap: 三路 (归一化切片列表, 权重) 的映射
-		"""
-		graph_chunks = state.get("graph_chunks", [])
-		embedding_chunks = state.get("embedding_chunks", [])
-		hyde_embedding_chunks = state.get("hyde_embedding_chunks", [])
-		
-		chunks_weighted_map: WeightedChunkMap = {
-			"graph_chunks_weighted": (self.normalize_chunk_entity(graph_chunks),1.0),
-			"embedding_chunks_weighted": (self.normalize_chunk_entity(embedding_chunks), 1.0),
-			"hyde_embedding_chunks_weighted": (self.normalize_chunk_entity(hyde_embedding_chunks), 0.7)
-		}
-		
-		return chunks_weighted_map
+    本节点在标准 RRF 之上引入了“路权重”：
+            score(d) = Σ_i weight_i / (k + rank_i(d))
+    标准 RRF 等价于所有 weight_i = 1；这里对噪声较大的 HyDE 路降权至 0.7。
 
-	@staticmethod
-	def normalize_chunk_entity(chunks: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
-		"""
-		统一格式化三路检索的chunks
+    注意：本类未覆盖基类 name，日志中节点名为默认的 "base_node"；
+    如需在日志中区分来源，可声明 name = "rrf_rank"。
+    """
 
-		graph_chunks: List[Dict[str,Any]
-		embedding_chunks: List[Dict[str,Any]
-		hyde_embedding_chunks: List[Dict[str,Any]
+    def process(self, state: QueryGraphState) -> QueryGraphState:
+        """节点主流程：读取三路检索结果 → 加权 RRF 融合 → 写回 rrf_chunks。
 
-		Args:
-			chunks:
+        Args:
+                state: 查询流程图状态，读取 graph_chunks / embedding_chunks /
+                        hyde_embedding_chunks 三个字段（缺省视为空列表）。
 
-		Returns:
+        Returns:
+                QueryGraphState: 写入 rrf_chunks 后的状态，值为按 RRF 分数降序排列的
+                        切片 entity 列表（不含分数）。
+        """
+        config = get_query_config()
 
-		"""
-		normalize_chunk_entities = []
-		for chunk in chunks:
-			entity = chunk.get("entity")
-			if not entity:
-				continue
-			normalize_chunk_entities.append(entity)
-		return  normalize_chunk_entities
-	
-	def merge_rrf_inputs(self, rrf_inputs:List[WeightedChunks], rrf_k:int, rrf_max_results:int):
-		"""
-		公式: score(d) = Σ weight_i / (k + rank_i(d))
-		Args:
-			rrf_inputs:
-			rrf_k:
-			rrf_max_results:
+        # 1. 收集并格式化三路检索的结果
+        chunks_weighted_map = self.collect_normalize_chunk_entity(state)
+        self.logger.info(
+            f"RRF 输入: "
+            f"向量检索={len(chunks_weighted_map['embedding_chunks_weighted'][0])}条, "
+            f"HyDE检索={len(chunks_weighted_map['hyde_embedding_chunks_weighted'][0])}条, "
+            f"知识图谱={len(chunks_weighted_map['graph_chunks_weighted'][0])}条"
+        )
 
-		Returns:
+        # 2. 提取三路结果和权重
+        rrf_inputs = list(chunks_weighted_map.values())
 
-		"""
-		if not rrf_inputs:
-			self.logger.warning(f"用于RRF融合排序的数据输入为空")
-			return  []
-		
-		
-		chunk_id_scores = {}
-		chunk_row_data = {}
-		for rrf_input_tuple in rrf_inputs:
-			chunk_entities = rrf_input_tuple[0]
-			chunk_weight = rrf_input_tuple[1]
-			if not chunk_entities:
-				continue
-			if not isinstance(chunk_entities,list):
-				continue
-				
-			# enumerate(chunk_entities,1) 表示index从1开始计数
-			for rank,chunk_entity in enumerate(chunk_entities,1):
-				chunk_id = chunk_entity.get("chunk_id")
-				if not chunk_id:
-					continue
-				
-				"""
-				RRF倒数排名融合算法公式
-				某一个chunk_id的得分 = chunk_id_scores[chunk_id]
-				chunk_id_scores.get(chunk_id,0)  这个chunk_id之前的累加之和
-				当前chunk在这一路的权重chunk_weight / 平滑参数rrf_k + 当前chunk在这一路的排名
-				
-				"""
-				chunk_id_scores[chunk_id] = chunk_id_scores.get(chunk_id,0) + chunk_weight / (rrf_k + rank)
-				"""
-				同一文档在多路中出现时，只保留第一次遇到的版本，保持结果一致性。
-				"""
-				chunk_row_data.setdefault(chunk_id,chunk_entity)
-				
-		
-		result = []
-		for chunk_id,chunk_id_score in chunk_id_scores.items():
-			first_meet_chunk = chunk_row_data[chunk_id]
-			result.append([first_meet_chunk,chunk_id_score])
-		
-		# 倒序排序，截取前rrf_max_results条结果
-		rrf_sorted_result = sorted(
-			result,
-			key=lambda item:item[1],
-			reverse=True
-		)
-		return rrf_sorted_result[:rrf_max_results]
-			
-	
-		
+        # 3. 将三路结果进行加权 RRF 融合排序：score = Σ weight / (k + rank)
+        rrf_merge_results = self.merge_rrf_inputs(
+            rrf_inputs, config.rrf_k, config.rrf_max_results
+        )
+
+        # 4. 只保留排序后的 chunk，丢弃 RRF 分数（分数仅用于排序与日志观察）
+        rrf_chunks = []
+        for rrf_merge_result in rrf_merge_results:
+            chunk = rrf_merge_result[0]
+            rrf_chunks.append(chunk)
+
+        # 5. 打印融合后的分数区间，用于观察 k 值与各路权重的配置是否合理
+        #    注意：若三路结果均为空，scores 为空列表，下面的 max/min 会抛 ValueError
+        scores = []
+        for rrf_merge_result in rrf_merge_results:
+            score = rrf_merge_result[1]
+            scores.append(score)
+        self.logger.info(f"RRF融合排序后的最大分:{max(scores):.6f}")
+        self.logger.info(f"RRF融合排序后的最小分:{min(scores):.6f}")
+
+        # 6. 写回状态，供下游 Rerank / 提示词构造节点使用
+        state["rrf_chunks"] = rrf_chunks
+
+        return state
+
+    def collect_normalize_chunk_entity(self, state) -> WeightedChunkMap:
+        """
+        从 state 中取出三路检索结果，统一“脱壳”为切片 entity 列表，并为每一路绑定融合权重。
+
+        三路数据来源：
+                graph_chunks: 知识图谱召回，权重 1.0
+                embedding_chunks: 原始查询的向量召回，权重 1.0
+                hyde_embedding_chunks: HyDE 假设答案的向量召回，权重 0.7
+
+        Args:
+                state: 查询流程图状态，缺失的字段按空列表处理（该路不参与融合）。
+
+        Returns:
+                WeightedChunkMap: 三路 (归一化切片列表, 权重) 的映射。
+        """
+        graph_chunks = state.get("graph_chunks", [])
+        embedding_chunks = state.get("embedding_chunks", [])
+        hyde_embedding_chunks = state.get("hyde_embedding_chunks", [])
+
+        chunks_weighted_map: WeightedChunkMap = {
+            # 权重 1.0 = 标准 RRF 贡献；0.7 = 对 HyDE 假设答案噪声的降权
+            "graph_chunks_weighted": (self.normalize_chunk_entity(graph_chunks), 1.0),
+            "embedding_chunks_weighted": (
+                self.normalize_chunk_entity(embedding_chunks),
+                1.0,
+            ),
+            "hyde_embedding_chunks_weighted": (
+                self.normalize_chunk_entity(hyde_embedding_chunks),
+                0.7,
+            ),
+        }
+
+        return chunks_weighted_map
+
+    @staticmethod
+    def normalize_chunk_entity(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        归一化三路检索结果：把不同结构的命中记录统一“脱壳”为 entity 字典列表。
+
+        三路输入的外层结构一致（均为 List[MilvusSearchHit]，即 {"distance":..., "entity":{...}}），
+        差异在 entity 内部字段（图谱路多 file_title，向量路多距离分等），本方法只取 entity，
+        使下游融合逻辑无需关心来源。
+
+        Args:
+                chunks: 单路检索的原始命中列表，元素形如 {"id":..., "distance":..., "entity":{...}}。
+
+        Returns:
+                List[Dict[str, Any]]: 切片 entity 列表，保持输入顺序（顺序即排名，RRF 依赖它）。
+                        缺少 entity 或 entity 为空的记录会被跳过。
+        """
+        normalize_chunk_entities = []
+        for chunk in chunks:
+            # 只取 entity 载体；无 entity 的记录无法参与融合，直接丢弃
+            entity = chunk.get("entity")
+            if not entity:
+                continue
+            normalize_chunk_entities.append(entity)
+        return normalize_chunk_entities
+
+    def merge_rrf_inputs(
+        self, rrf_inputs: List[WeightedChunks], rrf_k: int, rrf_max_results: int
+    ):
+        """
+        加权 RRF 核心：score(d) = Σ_i weight_i / (k + rank_i(d))
+
+        实现要点：
+                1. 排名 rank 从 1 开始，由输入列表顺序决定（列表需已按相关性降序）；
+                2. 文档未出现在某路结果中时，该路贡献为 0（无需特殊处理，不进字典即可）；
+                3. 加权体现在分子：标准 RRF 的 weight_i 恒为 1，这里按来源路取不同权重；
+                4. 同一 chunk_id 在多路重复出现时，分数累加，实体只保留首次遇到的版本。
+
+        Args:
+                rrf_inputs: 每路一个 (切片 entity 列表, 该路权重) 二元组。
+                rrf_k: 平滑常数 k，越大则中低排名文档也能获得更多贡献，默认 60。
+                rrf_max_results: 最终截断返回的条数（Top-N）。
+
+        Returns:
+                List[List]: 降序排列的 [[chunk_entity, score], ...]，最多 rrf_max_results 条；
+                        输入为空时返回空列表。
+        """
+        if not rrf_inputs:
+            self.logger.warning(f"用于RRF融合排序的数据输入为空")
+            return []
+
+        chunk_id_scores = {}  # chunk_id -> RRF 累加分数
+        chunk_row_data = {}  # chunk_id -> 首次遇到的切片 entity（去重后的结果载体）
+        for rrf_input_tuple in rrf_inputs:
+            chunk_entities = rrf_input_tuple[0]
+            chunk_weight = rrf_input_tuple[1]
+            if not chunk_entities:
+                continue
+            if not isinstance(chunk_entities, list):
+                continue
+
+            # enumerate(chunk_entities,1) 表示index从1开始计数
+            for rank, chunk_entity in enumerate(chunk_entities, 1):
+                chunk_id = chunk_entity.get("chunk_id")
+                if not chunk_id:
+                    continue
+
+                # RRF 倒数排名融合公式的累加：
+                #   chunk_id_scores[chunk_id] = 之前的累加之和 + 当前路贡献
+                #   当前路贡献 = 该路权重 chunk_weight / (平滑常数 rrf_k + 该路排名 rank)
+                chunk_id_scores[chunk_id] = chunk_id_scores.get(
+                    chunk_id, 0
+                ) + chunk_weight / (rrf_k + rank)
+                # 同一文档在多路中出现时，只保留第一次遇到的版本，保证结果内容与来源一致性
+                # 作用是「取值；若 key 不存在则写入默认值并返回它」；如果key已经存在，则直接返回已存的值后续不再更新值
+                chunk_row_data.setdefault(chunk_id, chunk_entity)
+
+        # 组装 [切片 entity, RRF 分数] 列表，entity 取去重时保留的首个版本
+        result = []
+        for chunk_id, chunk_id_score in chunk_id_scores.items():
+            first_meet_chunk = chunk_row_data[chunk_id]
+            result.append([first_meet_chunk, chunk_id_score])
+
+        # 按 RRF 分数倒序排序，截取前 rrf_max_results 条结果
+        # 排序稳定性：分数相同时依赖字典插入顺序（即首次出现顺序）
+        rrf_sorted_result = sorted(result, key=lambda item: item[1], reverse=True)
+        return rrf_sorted_result[:rrf_max_results]
 
 
 if __name__ == "__main__":
-	setup_logging()
-	print("开始测试RRF倒排融合查询节点")
-	
-	# 模拟 Milvus 混合检索返回的切片正文（原文含大量换行，用三引号字符串承载）
-	chunk_content_1 = """## 儿童健康
+    """
+    本地自测入口：用固定的三路 Mock 数据跑通 RRF 融合，验证排序是否符合预期。
+
+    数据设计：
+            - chunk ...318（儿童健康）：三路全部命中且排名靠前 → 预期位居第一；
+            - chunk ...322（个人信息和数据安全）：仅 HyDE 路与图谱路命中；
+            - chunk ...317（听力保护）：仅向量路命中且排名靠后 → 预期靠末位。
+      即验证“在多路都靠前的文档最终靠前”这一 RRF 核心行为。
+
+    运行方式（在仓库根目录执行）：
+            python -m knowledge.processor.query_process.nodes.rrf_rank_node
+    """
+    setup_logging()
+    print("开始测试RRF倒排融合查询节点")
+
+    # 模拟切片正文样例（原文含大量换行，用三引号字符串承载）
+    # 说明：这两个变量只是内容样例，下方的 mock 命中记录各自内联了正文，未直接引用它们
+    chunk_content_1 = """## 儿童健康
 
 
 • 本设备及其配件可能包含一些小零件，请将设备及其配件放置在儿童接触不到的地方。儿童可能在无意之中损坏本设备及其配件，或吞下小零件导致窒息或其他危险。
@@ -329,7 +392,7 @@ if __name__ == "__main__":
 • 若设备需要连接 USB 端口，请确认 USB 端口具备 USB-IF 标识且其性能符合 USB-IF 的相关规范。
 """
 
-	chunk_content_2 = """## 个人信息和数据安全
+    chunk_content_2 = """## 个人信息和数据安全
 
 
 在使用设备的一些功能和第三方应用时，可能会因为操作不正确或其他原因导致您的个人信息或数据泄露或丢失，建议按以下方式加强保护您的个人信息。
@@ -357,16 +420,18 @@ if __name__ == "__main__":
 本手册描述的产品中，可能包含华为及其可能存在的许可人享有版权的软件。除非获得相关权利人的许可，否则，任何人不能以任何形式对前述软件进行复制、分发、修改、摘录、反编译、反汇编、解密、反向工程、出租、转让、分许可等侵犯软件版权的行为，但是适用法律禁止此类限制的除外。
 """
 
-	# 三路检索的固定来源信息（同一商品、同一用户指南）
-	file_title = "HUAWEI MateStation S 12代酷睿版 用户指南-(PUC,Windows11_02,zh-cn)"
-	item_name = "HUAWEI MateStation S 12代酷睿版"
-	
-	hyde_embedding_chunks = [
-		{
-			'chunk_id': 468308814313816318,
-			'distance': 0.7616649866104126,
-			'entity': {
-				'content': """## 儿童健康
+    # 三路检索的固定来源信息（同一商品、同一用户指南）
+    file_title = "HUAWEI MateStation S 12代酷睿版 用户指南-(PUC,Windows11_02,zh-cn)"
+    item_name = "HUAWEI MateStation S 12代酷睿版"
+
+    # 第 1 路：HyDE 假设答案的向量检索结果（5 条，权重 0.7）
+    # 列表顺序即该路排名，按 distance 降序：318 > 319 > 320 > 314 > 322
+    hyde_embedding_chunks = [
+        {
+            "chunk_id": 468308814313816318,
+            "distance": 0.7616649866104126,
+            "entity": {
+                "content": """## 儿童健康
 
 
 	• 本设备及其配件可能包含一些小零件，请将设备及其配件放置在儿童接触不到的地方。儿童可能在无意之中损坏本设备及其配件，或吞下小零件导致窒息或其他危险。
@@ -391,15 +456,15 @@ if __name__ == "__main__":
 
 	• 若设备需要连接 USB 端口，请确认 USB 端口具备 USB-IF 标识且其性能符合 USB-IF 的相关规范。
 	""",
-				'item_name': 'HUAWEI MateStation S 12代酷睿版',
-				'chunk_id': 468308814313816318,
-			},
-		},
-		{
-			'chunk_id': 468308814313816319,
-			'distance': 0.45304620265960693,
-			'entity': {
-				'content': """## 电池安全
+                "item_name": "HUAWEI MateStation S 12代酷睿版",
+                "chunk_id": 468308814313816318,
+            },
+        },
+        {
+            "chunk_id": 468308814313816319,
+            "distance": 0.45304620265960693,
+            "entity": {
+                "content": """## 电池安全
 
 
 	• 如果更换不正确的型号的电池会有起火或爆炸的危险。
@@ -430,15 +495,15 @@ if __name__ == "__main__":
 
 	• 请勿让儿童接触电池。如果电池仓未安全闭合，停止使用该产品并使之远离儿童。如果吞食纽扣锂电池，在 2 小时内就可能导致严重的内部灼伤并可能导致死亡。如果误吞纽扣锂电池或误置入体内任何部位，请立即就医。
 	""",
-				'item_name': 'HUAWEI MateStation S 12代酷睿版',
-				'chunk_id': 468308814313816319,
-			},
-		},
-		{
-			'chunk_id': 468308814313816320,
-			'distance': 0.44662797451019287,
-			'entity': {
-				'content': """## 维护和保养
+                "item_name": "HUAWEI MateStation S 12代酷睿版",
+                "chunk_id": 468308814313816319,
+            },
+        },
+        {
+            "chunk_id": 468308814313816320,
+            "distance": 0.44662797451019287,
+            "entity": {
+                "content": """## 维护和保养
 
 
 	• 不建议您自行升级部件或更换模块。如有相关服务需求，请联系华为客户服务中心。
@@ -465,15 +530,15 @@ if __name__ == "__main__":
 
 	• 请遵守本设备及其附件处理的本地法令，并支持回收行动。
 	""",
-				'item_name': 'HUAWEI MateStation S 12代酷睿版',
-				'chunk_id': 468308814313816320,
-			},
-		},
-		{
-			'chunk_id': 468308814313816314,
-			'distance': 0.31772875785827637,
-			'entity': {
-				'content': """## 用户指南
+                "item_name": "HUAWEI MateStation S 12代酷睿版",
+                "chunk_id": 468308814313816320,
+            },
+        },
+        {
+            "chunk_id": 468308814313816314,
+            "distance": 0.31772875785827637,
+            "entity": {
+                "content": """## 用户指南
 
 
 
@@ -507,15 +572,15 @@ if __name__ == "__main__":
 	- 【14】：DP 接口接入 DP 线缆,连接显示设备。。
 
 	""",
-				'item_name': 'HUAWEI MateStation S 12代酷睿版',
-				'chunk_id': 468308814313816314,
-			},
-		},
-		{
-			'chunk_id': 468308814313816322,
-			'distance': 0.31507962942123413,
-			'entity': {
-				'content': """## 个人信息和数据安全
+                "item_name": "HUAWEI MateStation S 12代酷睿版",
+                "chunk_id": 468308814313816314,
+            },
+        },
+        {
+            "chunk_id": 468308814313816322,
+            "distance": 0.31507962942123413,
+            "entity": {
+                "content": """## 个人信息和数据安全
 
 
 	在使用设备的一些功能和第三方应用时，可能会因为操作不正确或其他原因导致您的个人信息或数据泄露或丢失，建议按以下方式加强保护您的个人信息。
@@ -542,18 +607,20 @@ if __name__ == "__main__":
 
 	本手册描述的产品中，可能包含华为及其可能存在的许可人享有版权的软件。除非获得相关权利人的许可，否则，任何人不能以任何形式对前述软件进行复制、分发、修改、摘录、反编译、反汇编、解密、反向工程、出租、转让、分许可等侵犯软件版权的行为，但是适用法律禁止此类限制的除外。
 	""",
-				'item_name': 'HUAWEI MateStation S 12代酷睿版',
-				'chunk_id': 468308814313816322,
-			},
-		},
-	]
-	embedding_chunks = [
-		{
-			'chunk_id': 468308814313816318,
-			'distance': 0.7072337865829468,
-			'entity': {
-				'item_name': 'HUAWEI MateStation S 12代酷睿版',
-				'content': """## 儿童健康
+                "item_name": "HUAWEI MateStation S 12代酷睿版",
+                "chunk_id": 468308814313816322,
+            },
+        },
+    ]
+    # 第 2 路：原始查询的向量检索结果（5 条，权重 1.0）
+    # 排名顺序：318 > 314 > 319 > 317 > 320（317 仅此路命中且靠后）
+    embedding_chunks = [
+        {
+            "chunk_id": 468308814313816318,
+            "distance": 0.7072337865829468,
+            "entity": {
+                "item_name": "HUAWEI MateStation S 12代酷睿版",
+                "content": """## 儿童健康
 
 
 	• 本设备及其配件可能包含一些小零件，请将设备及其配件放置在儿童接触不到的地方。儿童可能在无意之中损坏本设备及其配件，或吞下小零件导致窒息或其他危险。
@@ -578,15 +645,15 @@ if __name__ == "__main__":
 
 	• 若设备需要连接 USB 端口，请确认 USB 端口具备 USB-IF 标识且其性能符合 USB-IF 的相关规范。
 	""",
-				'chunk_id': 468308814313816318,
-			},
-		},
-		{
-			'chunk_id': 468308814313816314,
-			'distance': 0.6906517744064331,
-			'entity': {
-				'item_name': 'HUAWEI MateStation S 12代酷睿版',
-				'content': """## 用户指南
+                "chunk_id": 468308814313816318,
+            },
+        },
+        {
+            "chunk_id": 468308814313816314,
+            "distance": 0.6906517744064331,
+            "entity": {
+                "item_name": "HUAWEI MateStation S 12代酷睿版",
+                "content": """## 用户指南
 
 
 
@@ -621,15 +688,15 @@ if __name__ == "__main__":
 
 
 	""",
-				'chunk_id': 468308814313816314,
-			},
-		},
-		{
-			'chunk_id': 468308814313816319,
-			'distance': 0.4313352108001709,
-			'entity': {
-				'item_name': 'HUAWEI MateStation S 12代酷睿版',
-				'content': """## 电池安全
+                "chunk_id": 468308814313816314,
+            },
+        },
+        {
+            "chunk_id": 468308814313816319,
+            "distance": 0.4313352108001709,
+            "entity": {
+                "item_name": "HUAWEI MateStation S 12代酷睿版",
+                "content": """## 电池安全
 
 
 	• 如果更换不正确的型号的电池会有起火或爆炸的危险。
@@ -660,15 +727,15 @@ if __name__ == "__main__":
 
 	• 请勿让儿童接触电池。如果电池仓未安全闭合，停止使用该产品并使之远离儿童。如果吞食纽扣锂电池，在 2 小时内就可能导致严重的内部灼伤并可能导致死亡。如果误吞纽扣锂电池或误置入体内任何部位，请立即就医。
 	""",
-				'chunk_id': 468308814313816319,
-			},
-		},
-		{
-			'chunk_id': 468308814313816317,
-			'distance': 0.4210434556007385,
-			'entity': {
-				'item_name': 'HUAWEI MateStation S 12代酷睿版',
-				'content': """## 听力保护
+                "chunk_id": 468308814313816319,
+            },
+        },
+        {
+            "chunk_id": 468308814313816317,
+            "distance": 0.4210434556007385,
+            "entity": {
+                "item_name": "HUAWEI MateStation S 12代酷睿版",
+                "content": """## 听力保护
 
 
 	• 当您使用耳机收听音乐或通话时，建议使用音乐或通话所需的最小音量，以免损伤听力。长时间接触高音量可能会导致永久性听力损伤。
@@ -719,15 +786,15 @@ if __name__ == "__main__":
 
 	• 如果设备需要保留并更换位置， 也应考虑上述注意事项。
 	""",
-				'chunk_id': 468308814313816317,
-			},
-		},
-		{
-			'chunk_id': 468308814313816320,
-			'distance': 0.41851842403411865,
-			'entity': {
-				'item_name': 'HUAWEI MateStation S 12代酷睿版',
-				'content': """## 维护和保养
+                "chunk_id": 468308814313816317,
+            },
+        },
+        {
+            "chunk_id": 468308814313816320,
+            "distance": 0.41851842403411865,
+            "entity": {
+                "item_name": "HUAWEI MateStation S 12代酷睿版",
+                "content": """## 维护和保养
 
 
 	• 不建议您自行升级部件或更换模块。如有相关服务需求，请联系华为客户服务中心。
@@ -754,15 +821,17 @@ if __name__ == "__main__":
 
 	• 请遵守本设备及其附件处理的本地法令，并支持回收行动。
 	""",
-				'chunk_id': 468308814313816320,
-			},
-		},
-	]
-	graph_chunks  = [
-    {
-        'entity': {
-            'chunk_id': 468308814313816318,
-            'content': """## 儿童健康
+                "chunk_id": 468308814313816320,
+            },
+        },
+    ]
+    # 第 3 路：知识图谱召回结果（2 条，权重 1.0）
+    # 排名顺序：318 > 322；entity 内比向量路多一个 file_title 字段
+    graph_chunks = [
+        {
+            "entity": {
+                "chunk_id": 468308814313816318,
+                "content": """## 儿童健康
 
 
 • 本设备及其配件可能包含一些小零件，请将设备及其配件放置在儿童接触不到的地方。儿童可能在无意之中损坏本设备及其配件，或吞下小零件导致窒息或其他危险。
@@ -787,14 +856,14 @@ if __name__ == "__main__":
 
 • 若设备需要连接 USB 端口，请确认 USB 端口具备 USB-IF 标识且其性能符合 USB-IF 的相关规范。
 """,
-            'file_title': 'HUAWEI MateStation S 12代酷睿版 用户指南-(PUC,Windows11_02,zh-cn)',
-            'item_name': 'HUAWEI MateStation S 12代酷睿版',
+                "file_title": "HUAWEI MateStation S 12代酷睿版 用户指南-(PUC,Windows11_02,zh-cn)",
+                "item_name": "HUAWEI MateStation S 12代酷睿版",
+            },
         },
-    },
-    {
-        'entity': {
-            'chunk_id': 468308814313816322,
-            'content': """## 个人信息和数据安全
+        {
+            "entity": {
+                "chunk_id": 468308814313816322,
+                "content": """## 个人信息和数据安全
 
 
 在使用设备的一些功能和第三方应用时，可能会因为操作不正确或其他原因导致您的个人信息或数据泄露或丢失，建议按以下方式加强保护您的个人信息。
@@ -821,47 +890,21 @@ if __name__ == "__main__":
 
 本手册描述的产品中，可能包含华为及其可能存在的许可人享有版权的软件。除非获得相关权利人的许可，否则，任何人不能以任何形式对前述软件进行复制、分发、修改、摘录、反编译、反汇编、解密、反向工程、出租、转让、分许可等侵犯软件版权的行为，但是适用法律禁止此类限制的除外。
 """,
-            'file_title': 'HUAWEI MateStation S 12代酷睿版 用户指南-(PUC,Windows11_02,zh-cn)',
-            'item_name': 'HUAWEI MateStation S 12代酷睿版',
+                "file_title": "HUAWEI MateStation S 12代酷睿版 用户指南-(PUC,Windows11_02,zh-cn)",
+                "item_name": "HUAWEI MateStation S 12代酷睿版",
+            },
         },
-    },
-]
-	# 构造测试状态：图谱路命中两条，另外两路为空（结构与 MilvusSearchHit 一致）
-	
-	__state = {
-		"graph_chunks":graph_chunks,
-		"embedding_chunks": embedding_chunks,
-		"hyde_embedding_chunks": hyde_embedding_chunks,
-	}
+    ]
+    # 构造测试状态：三路均有命中（结构与 MilvusSearchHit 一致，即 {"distance":..., "entity":{...}}）
+    __state = {
+        "graph_chunks": graph_chunks,
+        "embedding_chunks": embedding_chunks,
+        "hyde_embedding_chunks": hyde_embedding_chunks,
+    }
 
-	rrf_node = RRFRankNode()
-	rrf_node.process(__state)
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
-	
+    rrf_node = RRFRankNode()
+    rrf_node.process(__state)
+
+    # 打印最终融合顺序，核对是否符合“多路靠前者最终靠前”的预期
+    for __idx, __chunk in enumerate(__state.get("rrf_chunks", []), 1):
+        print(f"Top{__idx}: chunk_id={__chunk.get('chunk_id')}")
