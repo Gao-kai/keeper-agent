@@ -333,6 +333,7 @@ class RRFRankNode(BaseNode):
                     chunk_id, 0
                 ) + chunk_weight / (rrf_k + rank)
                 # 同一文档在多路中出现时，只保留第一次遇到的版本，保证结果内容与来源一致性
+                # 因为相同的chunk_id在Milvus中对应的chunk内容都是相同的
                 # 作用是「取值；若 key 不存在则写入默认值并返回它」；如果key已经存在，则直接返回已存的值后续不再更新值
                 chunk_row_data.setdefault(chunk_id, chunk_entity)
 
