@@ -1,8 +1,57 @@
-from onnxruntime.quantization.neural_compressor.util import logger
-
+import logging
+from typing import TypedDict, List, Literal
+import numpy
 from knowledge.processor.query_process.base import BaseNode, T
+from knowledge.processor.query_process.config import get_query_config, QueryConfig
 from knowledge.processor.query_process.state import QueryGraphState
+from knowledge.utils.bge_reranker_base_model import get_bge_reranker_model
 from knowledge.utils.log_config import setup_logging
+
+
+class ReRankDocItemModel(TypedDict):
+    """重排序阶段统一的文档结构。
+
+    将 RRF 融合结果与 Web 搜索结果归一化成同一种结构，
+    便于后续统一送入 Reranker 打分、断崖检测截断。
+
+    Attributes:
+        content: 文档正文，Reranker 实际用于计算相关性的文本。
+            Web 来源取 snippet，取不到时回退到 content。
+        source: 文档来源，用于区分召回链路。
+            "web" 表示 Web 搜索结果，"rrf" 表示本地知识库经 RRF 融合后的结果。
+            写成 Literal 而非 "web" | "rrf"：| 只对类型对象生效，
+            对字符串实例会抛 TypeError。
+        chunk_id: 本地知识库切片 ID，Web 结果没有该字段，为 None。
+            下游 RRF 依赖它做去重投票，Web 文档因无 ID 不参与投票。
+        title: 文档标题。Web 来源取网页标题，
+            本地来源取 file_title（缺失时为空串）。
+        url: 文档链接，用于答案溯源时展示引用来源。
+            本地知识库切片为空串。
+    """
+
+    content: str
+    source: Literal["web", "rrf"]
+    chunk_id: str | None
+    title: str
+    url: str
+
+
+class ReRankScoredDocItemModel(ReRankDocItemModel):
+    """重排序后的文档结构，在 ReRankDocItemModel 基础上增加相关性分数。
+
+    单独拆出来而不是直接加在父类，是因为 score 是 Reranker 打分之后
+    才有的：构造候选集阶段没有该键，用类型把两个阶段区分开，
+    静态检查器可以拦住"未打分就传给断崖检测"这类错误。
+
+    Attributes:
+        score: Reranker 计算出的相关性分数，降序排列后用于断崖检测。
+            取 None 表示 Reranker 降级（模型加载失败 / 显存不足 /
+            输入超长），此时下游不参与截断判断，直接跳过。
+            注意 compute_score 返回 numpy.float32，需 float() 转换，
+            否则 json 序列化会报 float32 不可序列化。
+    """
+
+    score: float | None
 
 
 class ReRankNode(BaseNode):
@@ -21,6 +70,215 @@ class ReRankNode(BaseNode):
         Returns:
 
         """
+        config = get_query_config()
+        question = state.get("rewritten_query") or state.get("original_query", "")
+
+        # 1. 统一RRF融合排序后的chunk和通过Web搜索的文档为相同数据格式
+        doc_items: List[ReRankDocItemModel] = self.normalize_doc_items(state)
+
+        # 2. 调用re-rank重排序模型进行得分计算
+        ranked_doc_items: List[ReRankScoredDocItemModel] = self.rerank_docs(
+            doc_items, question
+        )
+
+        # 3. 执行动态Top-K断崖检测
+        top_k_docs = self.cliff_cut_docs(ranked_doc_items, config)
+        self.logger.info(f"重排序完成: {len(ranked_doc_items)} → {len(top_k_docs)}")
+
+        # 4. 更新state
+        state["reranked_docs"] = top_k_docs
+        return state
+
+    def normalize_doc_items(self, state: QueryGraphState) -> List[ReRankDocItemModel]:
+        """
+        将来自Web Search和RRF的chunks进行统一处理
+        Args:
+            state:
+
+        Returns:
+
+        """
+        web_search_docs = state.get("web_search_docs", [])
+        rrf_chunks = state.get("rrf_chunks", [])
+
+        doc_items: List[ReRankDocItemModel] = []
+
+        for web_search_doc_item in web_search_docs:
+            if not isinstance(web_search_doc_item, dict):
+                continue
+
+            snippet = web_search_doc_item.get("snippet", "").strip()
+            content = web_search_doc_item.get("content", "").strip()
+            item_content = snippet or content
+            title = web_search_doc_item.get("title", "").strip()
+            url = web_search_doc_item.get("url", "").strip()
+
+            doc_items.append(
+                {
+                    "content": item_content,
+                    "source": "web",
+                    "chunk_id": None,
+                    "title": title,
+                    "url": url,
+                }
+            )
+
+        for rrf_doc_item in rrf_chunks:
+            if not isinstance(rrf_doc_item, dict):
+                continue
+
+            content = rrf_doc_item.get("content", "").strip()
+            title = rrf_doc_item.get("file_title", "").strip()
+            url = rrf_doc_item.get("url", "").strip()
+            chunk_id = str(rrf_doc_item.get("chunk_id", "")).strip() or None
+
+            doc_items.append(
+                {
+                    "content": content,
+                    "source": "rrf",
+                    "chunk_id": chunk_id,
+                    "title": title,
+                    "url": url,
+                }
+            )
+
+        self.logger.info(f"合并文档: {len(doc_items)} 篇")
+
+        return doc_items
+
+    def rerank_docs(
+        self, doc_items: List[ReRankDocItemModel], question: str
+    ) -> List[ReRankScoredDocItemModel]:
+        """
+        重排序模型
+        Args:
+            doc_items: 归一化后的候选文档（本地 RRF + Web 搜索）
+            question: 用户问题（优先用改写后的 rewritten_query）
+
+        Returns:
+            按 reranker 得分倒序排列的文档列表。
+            降级（模型未加载 / 推理异常）时返回原序且 score 为 None，
+            下游断崖检测遇到 None 会跳过该对比，不会报错。
+        """
+
+        def _degrade_item_docs() -> List[ReRankScoredDocItemModel]:
+            """降级：保持原序，score 置空。"""
+            return [
+                ReRankScoredDocItemModel(
+                    content=item["content"],
+                    source=item["source"],
+                    chunk_id=item["chunk_id"],
+                    title=item["title"],
+                    url=item["url"],
+                    score=None,
+                )
+                for item in doc_items
+            ]
+
+        try:
+            bge_reranker_model = get_bge_reranker_model()
+            if bge_reranker_model is None:
+                return _degrade_item_docs()
+
+            re_rank_pairs = []
+
+            # 构建排序模型compute_score时所需参数对
+            for doc_item in doc_items:
+                content = doc_item.get("content")
+                pair = (question, content)
+                re_rank_pairs.append(pair)
+
+            # 执行计算 计算每一对Question-Content的得分
+            re_rank_scores: numpy.ndarray = bge_reranker_model.compute_score(
+                re_rank_pairs
+            )
+
+            # 收集结果
+            # 显式构造 TypedDict，而不是 {**doc_item, "score": ...}：
+            # 字典解包在静态检查里只会推导出 dict[str, object]，无法匹配 TypedDict 类型
+            results: List[ReRankScoredDocItemModel] = []
+            for doc_item, re_rank_score_by_doc_content in zip(
+                doc_items, re_rank_scores, strict=True
+            ):
+                results.append(
+                    ReRankScoredDocItemModel(
+                        content=doc_item["content"],
+                        source=doc_item["source"],
+                        chunk_id=doc_item["chunk_id"],
+                        title=doc_item["title"],
+                        url=doc_item["url"],
+                        # compute_score 返回 numpy.float32，转 float 才能 json 序列化
+                        score=float(re_rank_score_by_doc_content),
+                    )
+                )
+
+            # 按照得分倒序排序
+            return sorted(results, key=lambda item: item["score"], reverse=True)
+
+        except Exception as e:
+            self.logger.error(f"执行重排序re-rank失败:{e}")
+            self.logger.error(f"降级为按照原序列排序返回")
+            return _degrade_item_docs()
+
+    def cliff_cut_docs(
+        self, ranked_doc_items: List[ReRankScoredDocItemModel], config: QueryConfig
+    ):
+        """
+        执行断崖检测
+
+        绝对阈值：0.5 前后两次得分差值超出此值后面的直接截断
+        相对阈值：0.25 前后两次得分的下降比例超过此值后面的直接截断
+
+        # rerank_max_topk: int = 10  # 重排序最大返回数
+        # rerank_min_topk: int = 3  # 重排序最小返回数
+        # rerank_gap_ratio: float = 0.25  # 断崖检测阈值（相对）
+        # rerank_gap_abs: float = 0.5  # 断崖检测阈值（绝对）
+
+        Args:
+            ranked_doc_items:
+            config:
+
+        Returns:
+
+        """
+        upper_bound = min(config.rerank_max_topk, len(ranked_doc_items))
+        lower_bound = min(config.rerank_min_topk, upper_bound)
+
+        cut_off_index = lower_bound
+
+        """
+        range(lower_bound-1,upper_bound-1)
+        lower_bound是最小取多少个chunk给LLM，因此默认前lower_bound-1个是一定在最终取的范围内的
+        upper_bound是最大取多少个chunk给LLM，因此最多也不能超出第upper_bound-1
+        """
+        for index in range(lower_bound - 1, upper_bound - 1):
+            curr_score = ranked_doc_items[index].get("score")
+            next_score = ranked_doc_items[index + 1].get("score")
+            if curr_score is None or next_score is None:
+                continue
+
+            """
+            计算绝对差距和相对差距
+            为什么用1e-6
+            """
+            abs_gap = curr_score - next_score
+            rel_gap = abs_gap / (abs(curr_score) + 1e-6)
+
+            if abs_gap >= config.rerank_gap_abs:
+                cut_off_index = index + 1
+                self.logger.debug(
+                    f"断崖检测: 位置 {index + 1}, 绝对差距={abs_gap:.4f}, 相对差距={rel_gap:.4f}"
+                )
+                break
+
+            if rel_gap >= config.rerank_gap_ratio:
+                cut_off_index = index + 1
+                self.logger.debug(
+                    f"断崖检测: 位置 {index + 1}, 绝对差距={abs_gap:.4f}, 相对差距={rel_gap:.4f}"
+                )
+                break
+
+        return ranked_doc_items[:cut_off_index]
 
 
 if __name__ == "__main__":
@@ -44,7 +302,7 @@ if __name__ == "__main__":
             "url": "http://finance.sina.com.cn/zt_d/subject-1660881614",
         },
     ]
-    rrf_chunks = data = [
+    rrf_chunks = [
         {
             "chunk_id": 468308814313816318,
             "content": "## 儿童健康\n\n• 本设备及其配件可能包含一些小零件，请将设备及其配件放置在儿童接触不到的地方。儿童可能在无意之中损坏本设备及其配件，或吞下小零件导致窒息或其他危险。\n\n• 本设备并非玩具，儿童应在成人监护下使用设备。\n\n• 使用未经认可或不兼容的电源、充电器或电池，可能引发火灾、爆炸或其他危险。",
@@ -80,11 +338,12 @@ if __name__ == "__main__":
     ]
     rewritten_query = ""
     __state: QueryGraphState = {
-        "rrf_chunks": [],
+        "rrf_chunks": rrf_chunks,
         "web_search_docs": web_search_docs,
         "rewritten_query": "HUAWEI MateStation12电脑使用电源有哪些需要注意的安全点？",
     }
 
     reRankNode = ReRankNode()
     __state = reRankNode.process(__state)
+    logger = logging.getLogger()
     logger.info(__state)
