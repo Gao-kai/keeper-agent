@@ -1,8 +1,8 @@
 import logging
-from typing import TypedDict, List, Literal
-import numpy
-from knowledge.processor.query_process.base import BaseNode, T
-from knowledge.processor.query_process.config import get_query_config, QueryConfig
+from typing import List, Literal, Tuple, TypedDict
+
+from knowledge.processor.query_process.base import BaseNode
+from knowledge.processor.query_process.config import QueryConfig, get_query_config
 from knowledge.processor.query_process.state import QueryGraphState
 from knowledge.utils.bge_reranker_base_model import get_bge_reranker_model
 from knowledge.utils.log_config import setup_logging
@@ -55,22 +55,29 @@ class ReRankScoredDocItemModel(ReRankDocItemModel):
 
 
 class ReRankNode(BaseNode):
+    """重排序节点。
+
+    位于 RRF 融合与 Web 搜索之后、答案生成之前，负责把多路召回的候选文档
+    交给 Reranker 精排，并用断崖检测动态决定最终保留多少条。
+
+    处理流程：
+        1. normalize_doc_items: 把 RRF 结果和 Web 搜索结果归一化成同一种结构
+        2. rerank_docs: 用 BGE Reranker 对 (问题, 文档) 逐对打分并倒序排列
+        3. cliff_cut_docs: 断崖检测动态截断，替代固定 TopK
+    """
+
     def process(self, state: QueryGraphState) -> QueryGraphState:
-        """
-        重排序节点
-        1. 合并多个源头来的文档
-                - RRF倒排后的文档
-                - Web Search的文档
-        2. Reranker精排
-        3. 断崖检测截断
+        """执行重排序并写回 state。
 
         Args:
-                state:
+            state: 查询流程图状态。读取 rewritten_query / original_query、
+                rrf_chunks、web_search_docs；写回 reranked_docs。
 
         Returns:
-
+            更新了 reranked_docs 的 state。
         """
         config = get_query_config()
+        # 优先用改写后的问题（语义更完整）；改写失败时回退原始问题
         question = state.get("rewritten_query") or state.get("original_query", "")
 
         # 1. 统一RRF融合排序后的chunk和通过Web搜索的文档为相同数据格式
@@ -90,13 +97,19 @@ class ReRankNode(BaseNode):
         return state
 
     def normalize_doc_items(self, state: QueryGraphState) -> List[ReRankDocItemModel]:
-        """
-        将来自Web Search和RRF的chunks进行统一处理
+        """把 RRF 结果与 Web 搜索结果归一化成 ReRankDocItemModel。
+
+        两类数据源字段命名不同，这里统一成 content / source / chunk_id /
+        title / url 五个字段，让下游 Reranker 无需关心文档来源。
+
+        为什么网络搜索结果不参与 RRF 而在这里才加入：RRF 靠 chunk_id 投票，
+        网络文档没有 chunk_id 投不了；Reranker 靠语义打分，两者能同台竞争。
+
         Args:
-            state:
+            state: 查询流程图状态，读取 rrf_chunks 和 web_search_docs。
 
         Returns:
-
+            归一化后的文档列表；content 为空的文档已被过滤。
         """
         web_search_docs = state.get("web_search_docs", [])
         rrf_chunks = state.get("rrf_chunks", [])
@@ -107,20 +120,27 @@ class ReRankNode(BaseNode):
             if not isinstance(web_search_doc_item, dict):
                 continue
 
+            # Web 搜索结果优先用 snippet（摘要更贴近问题），取不到再回退 content
             snippet = web_search_doc_item.get("snippet", "").strip()
             content = web_search_doc_item.get("content", "").strip()
             item_content = snippet or content
             title = web_search_doc_item.get("title", "").strip()
             url = web_search_doc_item.get("url", "").strip()
 
+            # 正文为空的文档无法参与语义打分，直接丢弃，避免浪费 reranker 算力
+            if not item_content:
+                continue
+
             doc_items.append(
-                {
-                    "content": item_content,
-                    "source": "web",
-                    "chunk_id": None,
-                    "title": title,
-                    "url": url,
-                }
+                ReRankDocItemModel(
+                    content=item_content,
+                    source="web",
+                    # 网络文档没有本地切片 ID，置 None：
+                    # 下游若需去重投票，用 `if chunk_id` 即可区分
+                    chunk_id=None,
+                    title=title,
+                    url=url,
+                )
             )
 
         for rrf_doc_item in rrf_chunks:
@@ -128,23 +148,44 @@ class ReRankNode(BaseNode):
                 continue
 
             content = rrf_doc_item.get("content", "").strip()
+            # 本地切片的标题字段叫 file_title，与 Web 的 title 对齐
             title = rrf_doc_item.get("file_title", "").strip()
             url = rrf_doc_item.get("url", "").strip()
-            chunk_id = str(rrf_doc_item.get("chunk_id", "")).strip() or None
+
+            if not content:
+                continue
 
             doc_items.append(
-                {
-                    "content": content,
-                    "source": "rrf",
-                    "chunk_id": chunk_id,
-                    "title": title,
-                    "url": url,
-                }
+                ReRankDocItemModel(
+                    content=content,
+                    source="rrf",
+                    # chunk_id 可能是 int（如 468308814313816318），统一转成 str；
+                    # 缺失或为 None 时保持 None，不能直接 str(None) 否则会得到 "None" 字符串
+                    chunk_id=self._normalize_chunk_id(rrf_doc_item.get("chunk_id")),
+                    title=title,
+                    url=url,
+                )
             )
 
         self.logger.info(f"合并文档: {len(doc_items)} 篇")
 
         return doc_items
+
+    @staticmethod
+    def _normalize_chunk_id(raw_chunk_id) -> str | None:
+        """把切片 ID 统一转成字符串。
+
+        Args:
+            raw_chunk_id: 原始切片 ID，可能是 int / str / None。
+
+        Returns:
+            去空格后的字符串；原始值为空或 None 时返回 None。
+        """
+        if raw_chunk_id is None or raw_chunk_id == "":
+            return None
+        chunk_id = str(raw_chunk_id).strip()
+        # 防止 str(None) 这种已转成字符串的情况
+        return chunk_id if chunk_id and chunk_id != "None" else None
 
     def rerank_docs(
         self, doc_items: List[ReRankDocItemModel], question: str
@@ -175,21 +216,26 @@ class ReRankNode(BaseNode):
                 for item in doc_items
             ]
 
+        # 没有候选或没有问题时无需打分，直接返回空列表，避免把空列表喂给模型
+        if not doc_items or not question:
+            return []
+
         try:
             bge_reranker_model = get_bge_reranker_model()
             if bge_reranker_model is None:
                 return _degrade_item_docs()
 
-            re_rank_pairs = []
+            # 构建排序模型 compute_score 所需的 (问题, 文档) 参数对列表。
+            # 用元组而非列表：源码签名是 List[Tuple[str, str]]，
+            # 元组语义上表示"固定两个元素的配对"，更贴合问题-文档对的含义。
+            re_rank_pairs: List[Tuple[str, str]] = [
+                (question, doc_item["content"]) for doc_item in doc_items
+            ]
 
-            # 构建排序模型compute_score时所需参数对
-            for doc_item in doc_items:
-                content = doc_item.get("content")
-                pair = (question, content)
-                re_rank_pairs.append(pair)
-
-            # 执行计算 计算每一对Question-Content的得分
-            re_rank_scores: numpy.ndarray = bge_reranker_model.compute_score(
+            # 执行计算 计算每一对Question-Content的得分。
+            # 注意返回的是 List[float]（源码里 all_scores 是 Python list），
+            # 不是 numpy.ndarray；元素为 numpy.float32，需 float() 转换。
+            re_rank_scores: List[float] = bge_reranker_model.compute_score(
                 re_rank_pairs
             )
 
@@ -212,8 +258,14 @@ class ReRankNode(BaseNode):
                     )
                 )
 
-            # 按照得分倒序排序
-            return sorted(results, key=lambda item: item["score"], reverse=True)
+            # 按照得分倒序排序。
+            # 用 item["score"] or 兜底：正常路径 score 必然是 float，
+            # 但保险起见让 None 排在最后（0.0 等价于排在末尾），避免 TypeError
+            return sorted(
+                results,
+                key=lambda item: item["score"] if item["score"] is not None else 0.0,
+                reverse=True,
+            )
 
         except Exception as e:
             self.logger.error(f"执行重排序re-rank失败:{e}")
@@ -222,59 +274,63 @@ class ReRankNode(BaseNode):
 
     def cliff_cut_docs(
         self, ranked_doc_items: List[ReRankScoredDocItemModel], config: QueryConfig
-    ):
-        """
-        执行断崖检测
+    ) -> List[ReRankScoredDocItemModel]:
+        """断崖检测动态截断，替代固定 TopK。
 
-        绝对阈值：0.5 前后两次得分差值超出此值后面的直接截断
-        相对阈值：0.25 前后两次得分的下降比例超过此值后面的直接截断
+        固定 TopK 的两个问题：真实相关的只有 3 条时会混入噪声；
+        前 7 条都相关时会丢失有价值的第 6、7 条。这里改为寻找得分
+        "断崖式下跌"的位置截断，最少保留 min_topk 条（保底），
+        最多保留 max_topk 条（封顶）。
 
-        # rerank_max_topk: int = 10  # 重排序最大返回数
-        # rerank_min_topk: int = 3  # 重排序最小返回数
-        # rerank_gap_ratio: float = 0.25  # 断崖检测阈值（相对）
-        # rerank_gap_abs: float = 0.5  # 断崖检测阈值（绝对）
+        为什么需要两个阈值：
+            绝对阈值调高了低分区漏检，调低了高分区误杀。
+            高分区（如 8.0→7.2）绝对差距大但比例小，靠 abs_gap 抓；
+            低分区（如 0.8→0.5）绝对差距小但比例大，靠 rel_gap 抓。
+            两者用 or 连接，互相补位。
 
         Args:
-            ranked_doc_items:
-            config:
+            ranked_doc_items: 按 reranker 得分倒序排列的文档列表。
+            config: 查询流程配置，读取 rerank_max_topk / rerank_min_topk /
+                rerank_gap_abs / rerank_gap_ratio。
 
         Returns:
-
+            截断后的文档列表；质量断崖之后的低分文档被丢弃。
         """
+        if not ranked_doc_items:
+            return []
+
+        # 最多不能超过文档总数（候选不足 max_topk 时），最少也不能超过最大值
         upper_bound = min(config.rerank_max_topk, len(ranked_doc_items))
         lower_bound = min(config.rerank_min_topk, upper_bound)
 
-        cut_off_index = lower_bound
+        # 默认取到上限：没检测到断崖就说明质量平稳，全取
+        # （注意不能初始化成 lower_bound，否则未检出断崖时会丢掉 4~max_topk 条）
+        cut_off_index = upper_bound
 
-        """
-        range(lower_bound-1,upper_bound-1)
-        lower_bound是最小取多少个chunk给LLM，因此默认前lower_bound-1个是一定在最终取的范围内的
-        upper_bound是最大取多少个chunk给LLM，因此最多也不能超出第upper_bound-1
-        """
+        # 从 lower_bound 之后的第一对开始检查：
+        # 前 lower_bound 条是保底量，无论得分如何都保留，不参与断崖判断。
+        # 检查区间是 [lower_bound-1, upper_bound-1)，即比较第 i 条与第 i+1 条。
         for index in range(lower_bound - 1, upper_bound - 1):
             curr_score = ranked_doc_items[index].get("score")
             next_score = ranked_doc_items[index + 1].get("score")
+
+            # 分数为空说明 reranker 降级，无法比较，跳过该对
             if curr_score is None or next_score is None:
                 continue
 
-            """
-            计算绝对差距和相对差距
-            为什么用1e-6
-            """
+            # 绝对差距：捕捉高分区的大幅下跌
             abs_gap = curr_score - next_score
+            # 相对差距：捕捉低分区的比例性下跌。
+            # 分母加 1e-6 有两层作用：防止 curr_score 为 0 时除零；
+            # 分数可能是负数，用 abs() 保证分母为正、比例方向正确。
             rel_gap = abs_gap / (abs(curr_score) + 1e-6)
 
-            if abs_gap >= config.rerank_gap_abs:
+            # 任一条件满足即为断崖，立即截断（用 or 而非 and，否则明显的断崖会漏检）
+            if abs_gap >= config.rerank_gap_abs or rel_gap >= config.rerank_gap_ratio:
                 cut_off_index = index + 1
                 self.logger.debug(
-                    f"断崖检测: 位置 {index + 1}, 绝对差距={abs_gap:.4f}, 相对差距={rel_gap:.4f}"
-                )
-                break
-
-            if rel_gap >= config.rerank_gap_ratio:
-                cut_off_index = index + 1
-                self.logger.debug(
-                    f"断崖检测: 位置 {index + 1}, 绝对差距={abs_gap:.4f}, 相对差距={rel_gap:.4f}"
+                    f"断崖检测: 位置 {index + 1}, "
+                    f"绝对差距={abs_gap:.4f}, 相对差距={rel_gap:.4f}"
                 )
                 break
 
