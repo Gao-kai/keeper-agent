@@ -2,8 +2,10 @@ from typing import List
 
 from knowledge.processor.query_process.base import BaseNode, T
 from knowledge.processor.query_process.config import get_query_config, QueryConfig
+from knowledge.processor.query_process.exception import LLMError
 from knowledge.processor.query_process.state import QueryGraphState
 from knowledge.prompts.query_prompt import ANSWER_PROMPT
+from knowledge.utils.llm_client import get_llm_client
 
 
 class AnswerOutputNode(BaseNode):
@@ -30,11 +32,10 @@ class AnswerOutputNode(BaseNode):
         if answer:
             return state
         else:
-
-            is_stream = state.get("is_stream")
             prompt = self.build_prompt(state, config)
             state["prompt"] = prompt
             self.generate_answer(state, prompt)
+
         return state
 
     def build_prompt(self, state: QueryGraphState, config: QueryConfig):
@@ -196,6 +197,46 @@ class AnswerOutputNode(BaseNode):
         Returns:
 
         """
+        self.log_step(step_name="STEP-3", message="调用LLM生成答案")
+
+        llm_client = get_llm_client()
+        if llm_client is None:
+            raise LLMError(message="LLM客户端初始化失败")
+
+        task_id = state["task_id"]
+        is_stream = state.get("is_stream")
+
+        if is_stream:
+            self.stream_generate(llm_client, prompt, task_id)
+        else:
+            self.invoke_generate(llm_client, prompt)
+
+    def stream_generate(self, llm_client, prompt, task_id):
+        """
+
+        Args:
+            llm_client:
+            prompt:
+            task_id:
+
+        Returns:
+
+        """
+        total_words = ""
+
+        try:
+            for chunk in llm_client.stream(prompt):
+                delta_text = getattr(chunk, "content", "") or ""
+                if delta_text:
+                    total_words += delta_text
+                    # push_sse_event()
+        except Exception as e:
+            self.logger.error(f"流式生成出错: {e}")
+
+        return total_words
+
+    def invoke_generate(self, llm_client, prompt):
+        pass
 
 
 if __name__ == "__main__":

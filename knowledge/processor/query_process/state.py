@@ -9,7 +9,7 @@ from typing import TypedDict, List
 import copy
 
 
-class QueryGraphState(TypedDict,total=False):
+class QueryGraphState(TypedDict, total=False):
     """查询流程图状态。
 
     包含整个查询流程中传递的所有数据。
@@ -33,6 +33,7 @@ class QueryGraphState(TypedDict,total=False):
         graph_relation_texts: 知识图谱三元组列表。
     """
 
+    task_id: str
     session_id: str
     message_id: str
     original_query: str
@@ -54,22 +55,23 @@ class QueryGraphState(TypedDict,total=False):
 # ==================== 默认状态 ====================
 
 QUERY_GRAPH_DEFAULT_STATE: QueryGraphState = {
-    "session_id": "",               # 会话 ID
-    "message_id": "",               # 消息 ID
-    "original_query": "",           # 原始查询
-    "embedding_chunks": [],         # 向量检索结果
-    "hyde_embedding_chunks": [],    # HyDE 检索结果
-    "rrf_chunks": [],               # RRF 融合后的切片
-    "web_search_docs": [],          # 网页搜索结果
-    "reranked_docs": [],            # 重排序后的文档
-    "prompt": "",                   # 提示词
-    "answer": "",                   # 答案
-    "item_names": [],               # 商品名称
-    "rewritten_query": "",          # 重写查询
-    "history": [],                  # 历史对话
-    "is_stream": False,             # 是否流式输出
-    "graph_chunks": [],                # 知识图谱切片
-    "graph_relation_texts": []                # 知识图谱关系
+    "task_id": "",  # 任务 ID
+    "session_id": "",  # 会话 ID
+    "message_id": "",  # 消息 ID
+    "original_query": "",  # 原始查询
+    "embedding_chunks": [],  # 向量检索结果
+    "hyde_embedding_chunks": [],  # HyDE 检索结果
+    "rrf_chunks": [],  # RRF 融合后的切片
+    "web_search_docs": [],  # 网页搜索结果
+    "reranked_docs": [],  # 重排序后的文档
+    "prompt": "",  # 提示词
+    "answer": "",  # 答案
+    "item_names": [],  # 商品名称
+    "rewritten_query": "",  # 重写查询
+    "history": [],  # 历史对话
+    "is_stream": False,  # 是否流式输出
+    "graph_chunks": [],  # 知识图谱切片
+    "graph_relation_texts": [],  # 知识图谱关系
 }
 
 
