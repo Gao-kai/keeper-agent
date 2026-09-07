@@ -55,6 +55,7 @@ class ReRankScoredDocItemModel(ReRankDocItemModel):
 
 
 class ReRankNode(BaseNode):
+    name = "re_rank_node"
     """重排序节点。
 
     位于 RRF 融合与 Web 搜索之后、答案生成之前，负责把多路召回的候选文档
@@ -235,8 +236,8 @@ class ReRankNode(BaseNode):
             # 执行计算 计算每一对Question-Content的得分。
             # 注意返回的是 List[float]（源码里 all_scores 是 Python list），
             # 不是 numpy.ndarray；元素为 numpy.float32，需 float() 转换。
-            re_rank_scores: List[float] = bge_reranker_model.compute_score(
-                re_rank_pairs
+            re_rank_scores = bge_reranker_model.compute_score(
+                sentence_pairs=re_rank_pairs
             )
 
             # 收集结果

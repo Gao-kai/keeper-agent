@@ -650,6 +650,7 @@ class EntityAligner:
 
 
 class QueryKnowledgeGraphNode(BaseNode):
+    name = "query_knowledge_graph_node"
     """
     知识图谱查询节点（查询工作流中的一个图节点）
     主要是针对于精确的实体名称被LLM抽取匹配到的查询

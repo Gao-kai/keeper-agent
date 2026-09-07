@@ -164,6 +164,7 @@ class WeightedChunkMap(TypedDict):
 
 
 class RRFRankNode(BaseNode):
+    name = "rrf_rank_node"
     """
     希望头部排名为主 K比较小
     希望头部排名为辅 综合其它排名 K比较大
