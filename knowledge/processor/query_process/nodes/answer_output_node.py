@@ -241,6 +241,7 @@ class AnswerOutputNode(BaseNode):
 
 if __name__ == "__main__":
     answerOutputNode = AnswerOutputNode()
+
     __state = {
         "reranked_docs": [
             {
