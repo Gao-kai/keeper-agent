@@ -10,6 +10,22 @@ from knowledge.utils.llm_client import get_llm_client
 
 class AnswerOutputNode(BaseNode):
     name = "answer_output_node"
+    """
+    SSE的简介和格式
+    一轮绘画中的多个问题
+    为什么AI时代SSE用的最多
+    
+    # 1. 基于生产者和消费者的消息推送模型
+    
+    [生产侧] 后台线程 / LangGraph 节点          [消费侧] SSE 请求协程
+    push_sse_event(task_id, ...)                sse_generator()
+    → 同步代码，跑在工作线程                     → async 代码，跑在事件循环
+    → 拿不到 Response 对象                       → 唯一能写响应的地方
+         │                                            ▲
+         └────────────  queue  ← 唯一的桥  ────────────┘
+                     put(生产者)          get(消费者)
+
+    """
 
     def process(self, state: QueryGraphState) -> QueryGraphState:
         """
