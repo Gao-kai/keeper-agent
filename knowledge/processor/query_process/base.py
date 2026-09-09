@@ -74,7 +74,7 @@ class BaseNode(ABC):
 
         if session_id:
             try:
-                add_running_task(session_id, self.name, is_stream)
+                add_running_task(session_id, self.name)
             except Exception as e:
                 self.logger.warning(f"任务追踪注册失败: {e}")
 
@@ -85,7 +85,7 @@ class BaseNode(ABC):
             # 标记任务完成
             if session_id:
                 try:
-                    add_completed_task(session_id, self.name, is_stream)
+                    add_completed_task(session_id, self.name)
                 except Exception as e:
                     self.logger.warning(f"任务完成标记失败: {e}")
 
@@ -95,11 +95,7 @@ class BaseNode(ABC):
             raise
         except Exception as e:
             self.logger.error(f"{self.name} 执行失败: {e}")
-            raise QueryProcessError(
-                message=str(e),
-                node_name=self.name,
-                cause=e
-            )
+            raise QueryProcessError(message=str(e), node_name=self.name, cause=e)
 
     @abstractmethod
     def process(self, state: T) -> T:
@@ -136,6 +132,6 @@ def setup_logging(level: int = logging.INFO):
     """
     logging.basicConfig(
         level=level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )

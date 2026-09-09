@@ -685,11 +685,11 @@ class QueryKnowledgeGraphNode(BaseNode):
         graph_chunks = pipeline_result.get("graph_chunks", [])
         graph_relation_texts = pipeline_result.get("graph_relation_texts", [])
 
-        # 3. 更新state节点
-        state["graph_chunks"] = graph_chunks
-        state["graph_relation_texts"] = graph_relation_texts
-
-        return state
+        # 3. 返回增量更新（只回写本节点负责的字段，避免与并行分支节点写同一 key 冲突）
+        return {
+            "graph_chunks": graph_chunks,
+            "graph_relation_texts": graph_relation_texts,
+        }
 
     def validate_inputs(self, state: QueryGraphState):
         """

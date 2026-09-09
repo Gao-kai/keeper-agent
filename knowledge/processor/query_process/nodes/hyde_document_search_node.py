@@ -39,7 +39,7 @@ class HydeDocumentEmbeddingSearchNode(BaseNode):
         # 2. 获取LLM客户端
         llm_client = get_llm_client()
         if llm_client is None:
-            return state
+            return {}
         self.log_step("step_2", f"构建生成假设性问题的提示词模版")
 
         # 3. 构建生成假设性答案的提示词模版
@@ -55,7 +55,7 @@ class HydeDocumentEmbeddingSearchNode(BaseNode):
         )
 
         if not response:
-            return state
+            return {}
 
         # 4. 生成假设性答案
         hypothetical_answer = response.content
@@ -67,7 +67,7 @@ class HydeDocumentEmbeddingSearchNode(BaseNode):
         self.log_step("step_5", f"LLM生成假设性问题转化为混合向量")
         bge_m3_model = get_bge_m3_embedding_model()
         if bge_m3_model is None:
-            return state
+            return {}
 
         final_content = f"{rewritten_query}\n{hypothetical_answer}"
 
@@ -76,13 +76,13 @@ class HydeDocumentEmbeddingSearchNode(BaseNode):
         )
 
         if rewritten_query_hybrid_embedding is None:
-            return state
+            return {}
 
         # 6. 构建混合请求对象
         self.log_step("step_6", f"构建混合请求对象")
         milvus_client = get_milvus_client()
         if milvus_client is None:
-            return state
+            return {}
 
         expr = "item_name IN {item_names}"
         expr_params = {"item_names": item_names}
@@ -113,7 +113,7 @@ class HydeDocumentEmbeddingSearchNode(BaseNode):
         )
 
         if search_result is None:
-            return state
+            return {}
 
         # 8. 更新state对象
         hyde_embedding_chunks = search_result[0] if search_result else []

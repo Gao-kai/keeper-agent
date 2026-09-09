@@ -1,6 +1,6 @@
 from typing import List
 
-from knowledge.processor.query_process.base import BaseNode, T
+from knowledge.processor.query_process.base import BaseNode
 from knowledge.processor.query_process.config import get_query_config, QueryConfig
 from knowledge.processor.query_process.exception import LLMError
 from knowledge.processor.query_process.state import QueryGraphState
@@ -30,7 +30,7 @@ class AnswerOutputNode(BaseNode):
 
         answer = state.get("answer")
         if answer:
-            return state
+            self.push_existing_answer(state)
         else:
             prompt = self.build_prompt(state, config)
             state["prompt"] = prompt
@@ -44,10 +44,11 @@ class AnswerOutputNode(BaseNode):
 
         顺序：
         1. 系统提示词
-        2. re-rank重排序信息
-        3. 历史消息
-        4. neo-4j三元组结构化信息
-        5. 重写后用户问题
+        2. re-rank重排序后源文档  提供核心证据
+        3. 历史消息 提供上下文信息
+        4. neo-4j三元组结构化信息 补充结构化知识
+        5. 重写后用户问题 明确回答目标
+        6. 商品名称 限定回答范围边界
 
         字符预算控制：
         最大不能超出config中配置的最大字符
@@ -80,11 +81,14 @@ class AnswerOutputNode(BaseNode):
         item_names = state.get("item_names")
         available_llm_prompt_length = config.max_context_chars
 
+        # 生成提示词中包含元数据 得分高低以及文档来源 帮助大模型判断并且在答案中标注来源
         re_ranked_doc_prompts, available_llm_prompt_length = (
             self.generate_re_ranked_doc_prompt(
                 state, config, available_llm_prompt_length
             )
         )
+
+        # 生成提示词中包含实体之间关系 短文档 和前面的检索长文档互补 提供关系链
         graph_relation_texts_prompts, available_llm_prompt_length = (
             self.generate_graph_relation_texts_prompt(
                 state, config, available_llm_prompt_length
@@ -92,10 +96,10 @@ class AnswerOutputNode(BaseNode):
         )
 
         return ANSWER_PROMPT.format(
-            re_ranked_docs=re_ranked_doc_prompts,
+            re_ranked_docs=re_ranked_doc_prompts or "暂无内部知识库参考内容",
             history="暂无历史对话",
             item_names=item_names,
-            graph_relation_texts=graph_relation_texts_prompts,
+            graph_relation_texts=graph_relation_texts_prompts or "暂无知识图谱关系",
             question=question,
         )
 
@@ -121,10 +125,11 @@ class AnswerOutputNode(BaseNode):
         reranked_docs = state.get("reranked_docs")
         if not reranked_docs:
             return None
-
+        used_char_length = 0
         prompt_list = []
+
         for index, reranked_doc in enumerate(reranked_docs):
-            collection: List[str] = [f"[{index+1}]"]
+            tags: List[str] = [f"[{index+1}]"]
             content = reranked_doc.get("content")
             for key, value in reranked_doc.items():
                 if key == "content":
@@ -133,18 +138,20 @@ class AnswerOutputNode(BaseNode):
                 if not value:
                     value = "None"
 
-                collection.append(f"[{key}={value}]")
+                tags.append(f"[{key}={value}]")
 
-            reranked_doc_prompt = f"""
-{" ".join(collection)}\n
-{content}""".strip()
+            tags_to_str = " ".join(tags)
+            reranked_doc_prompt = ("" + tags_to_str + "\n" + content).strip()
+            if (
+                used_char_length + len(reranked_doc_prompt)
+                >= available_llm_prompt_length
+            ):
+                break
             prompt_list.append(reranked_doc_prompt)
+            used_char_length += len(reranked_doc_prompt) + 2
 
         re_rank_doc_prompts = "\n\n".join(prompt_list)
-        prompt_len = len(re_rank_doc_prompts)
-
-        if available_llm_prompt_length - prompt_len <= 0:
-            return None
+        available_llm_prompt_length -= used_char_length
 
         return re_rank_doc_prompts, available_llm_prompt_length
 
@@ -173,17 +180,22 @@ class AnswerOutputNode(BaseNode):
         if not graph_relation_texts:
             return None
 
+        used_char_length = 0
         prompt_list = []
         for index, graph_relation_text in enumerate(graph_relation_texts):
-            collection: List[str] = [f"[{index+1}]", f"{graph_relation_text}"]
-            graph_relation_text_prompt = "  ".join(collection)
+            tags: List[str] = [f"[{index+1}]", f"{graph_relation_text}"]
+            graph_relation_text_prompt = "  ".join(tags)
+            if (
+                len(graph_relation_text_prompt) + used_char_length
+                >= available_llm_prompt_length
+            ):
+                break
+
             prompt_list.append(graph_relation_text_prompt)
+            used_char_length += len(graph_relation_text_prompt) + 1
 
         graph_relation_text_prompts = "\n".join(prompt_list)
-        prompt_len = len(graph_relation_text_prompts)
-
-        if available_llm_prompt_length - prompt_len <= 0:
-            return None
+        available_llm_prompt_length -= used_char_length
 
         return graph_relation_text_prompts, available_llm_prompt_length
 
@@ -207,9 +219,9 @@ class AnswerOutputNode(BaseNode):
         is_stream = state.get("is_stream")
 
         if is_stream:
-            self.stream_generate(llm_client, prompt, task_id)
+            state["answer"] = self.stream_generate(llm_client, prompt, task_id)
         else:
-            self.invoke_generate(llm_client, prompt)
+            state["answer"] = self.invoke_generate(llm_client, prompt)
 
     def stream_generate(self, llm_client, prompt, task_id):
         """
@@ -236,7 +248,18 @@ class AnswerOutputNode(BaseNode):
         return total_words
 
     def invoke_generate(self, llm_client, prompt):
-        pass
+        try:
+            response = llm_client.invoke(prompt)
+            return response.content
+        except Exception as e:
+            self.logger.error(f"生成答案出错: {e}")
+
+        return "抱歉，回答您的问题时出现了一些问题"
+
+    def push_existing_answer(self, state: QueryGraphState):
+        is_stream = state.get("is_stream")
+        if not is_stream:
+            pass
 
 
 if __name__ == "__main__":

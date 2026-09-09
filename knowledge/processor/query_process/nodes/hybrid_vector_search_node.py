@@ -24,7 +24,7 @@ class HybridVectorSearchNode(BaseNode):
 		# 2. 将上一节点大模型重写后的用户问题进行向量化
 		bge_m3_model = get_bge_m3_embedding_model()
 		if bge_m3_model is None:
-			return state
+			return {}
 		
 		rewritten_query_hybrid_embedding = generate_hybrid_embeddings(
 			embedding_docs=[rewritten_query],
@@ -33,13 +33,13 @@ class HybridVectorSearchNode(BaseNode):
 		self.log_step("step_2", f"用户问题成功转化为混合向量")
 		
 		if rewritten_query_hybrid_embedding is None:
-			return state
+			return {}
 	
 		# 3. 构建混合查询请求
 		# 可以在搜索请求中包含过滤条件，以便 Milvus 在进行 ANN 搜索前进行元数据过滤，将搜索范围从整个 Collections 缩小到只搜索符合指定过滤条件的实体
 		milvus_client = get_milvus_client()
 		if milvus_client is None:
-			return state
+			return {}
 		
 		expr = "item_name IN {item_names}"
 		expr_params = {"item_names": item_names}
@@ -70,7 +70,7 @@ class HybridVectorSearchNode(BaseNode):
 		)
 		
 		if search_result is None:
-			return state
+			return {}
 		
 		# 5. 更新state
 		chunks = search_result[0] if search_result else []
