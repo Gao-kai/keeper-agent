@@ -179,7 +179,7 @@ async def sse_generator(task_id: str, request: Request):
                 break
 
             try:
-                # 不停的将队列中的数据推给前端 除非1s之内队列还没有数据就挂起
+                # 不停的将队列中的数据推给前端 除非1s之内队列还没有数据就continue 但是循环不会退出
                 msg = await asyncio.to_thread(task_queue.get, True, 1.0)
             except queue.Empty:
                 continue

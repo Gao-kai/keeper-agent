@@ -6,6 +6,8 @@ from knowledge.processor.query_process.exception import LLMError
 from knowledge.processor.query_process.state import QueryGraphState
 from knowledge.prompts.query_prompt import ANSWER_PROMPT
 from knowledge.utils.llm_client import get_llm_client
+from knowledge.utils.sse_push import push_sse_event, SSEEvent, set_sse_queue
+from knowledge.utils.task_status import set_task_result
 
 
 class AnswerOutputNode(BaseNode):
@@ -45,12 +47,26 @@ class AnswerOutputNode(BaseNode):
         config = get_query_config()
 
         answer = state.get("answer")
+        task_id = state.get("task_id")
+
+        # 1. 如果未调用LLM前就有答案 说明是商品名识别节点未识别出商品名/商品名多选一 此时保存答案 等待后面统一返回给前端
         if answer:
-            self.push_existing_answer(state)
+            set_task_result(task_id, answer)
         else:
             prompt = self.build_prompt(state, config)
             state["prompt"] = prompt
             self.generate_answer(state, prompt)
+
+        # TODO 写入历史记录
+
+        # 流式模式发送结束事件
+        is_stream = state.get("is_stream")
+        if is_stream:
+            push_sse_event(
+                task_id=task_id,
+                event=SSEEvent.FINAL,
+                data={"answer": state.get("answer", "")},
+            )
 
         return state
 
@@ -103,6 +119,8 @@ class AnswerOutputNode(BaseNode):
                 state, config, available_llm_prompt_length
             )
         )
+
+        # TODO 新增历史上下文对话
 
         # 生成提示词中包含实体之间关系 短文档 和前面的检索长文档互补 提供关系链
         graph_relation_texts_prompts, available_llm_prompt_length = (
@@ -238,6 +256,8 @@ class AnswerOutputNode(BaseNode):
             state["answer"] = self.stream_generate(llm_client, prompt, task_id)
         else:
             state["answer"] = self.invoke_generate(llm_client, prompt)
+            # 非流式输出 存入任务执行结果 后面返回给FE
+            set_task_result(task_id, state.get("answer", ""))
 
     def stream_generate(self, llm_client, prompt, task_id):
         """
@@ -257,7 +277,7 @@ class AnswerOutputNode(BaseNode):
                 delta_text = getattr(chunk, "content", "") or ""
                 if delta_text:
                     total_words += delta_text
-                    # push_sse_event()
+                    push_sse_event(task_id, "delta", {"delta": delta_text})
         except Exception as e:
             self.logger.error(f"流式生成出错: {e}")
 
@@ -271,11 +291,6 @@ class AnswerOutputNode(BaseNode):
             self.logger.error(f"生成答案出错: {e}")
 
         return "抱歉，回答您的问题时出现了一些问题"
-
-    def push_existing_answer(self, state: QueryGraphState):
-        is_stream = state.get("is_stream")
-        if not is_stream:
-            pass
 
 
 if __name__ == "__main__":
