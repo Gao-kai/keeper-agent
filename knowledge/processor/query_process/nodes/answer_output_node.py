@@ -59,7 +59,7 @@ class AnswerOutputNode(BaseNode):
 
         # TODO 写入历史记录
 
-        # 流式模式发送结束事件
+        # 流式模式发送结束事件（会将未识别出商品名的答案一起流式输出给前端）
         is_stream = state.get("is_stream")
         if is_stream:
             push_sse_event(
