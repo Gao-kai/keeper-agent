@@ -153,11 +153,9 @@ class MongoDBTool:
             result = self.chat_message.update_many(
                 filter={
                     "_id": {"$in": object_ids},
-                    "$or": [
-                        {"item_names": {"$exists": False}},
-                        {"item_names": []},
-                        {"item_names": None},
-                    ],
+                    # 「实际为空」才更新：不存在 / [] / null / [""] / [" "] 等
+                    # 只要有任意一个非空白字符串元素，就说明已有商品名，跳过
+                    "$nor": [{"item_names": {"$elemMatch": {"$regex": r"\S"}}}],
                 },
                 update={"$set": {"item_names": item_names}},
             )

@@ -283,7 +283,10 @@ class AnswerOutputNode(BaseNode):
         used_char_length = 0
         prompt_list = []
         for index, chat_document in enumerate(chat_history):
-            messages: List[str] = [f"[{chat_document.role}]", f"{chat_document.text}"]
+            messages: List[str] = [
+                f"[{chat_document.get('role', '')}]",
+                f"{chat_document.get('text', '')}",
+            ]
             chat_message_prompt = "  ".join(messages)
             if (
                 len(chat_message_prompt) + used_char_length

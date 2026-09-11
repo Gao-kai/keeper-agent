@@ -147,6 +147,7 @@ def run_query_graph(
         original_query=question,
         item_names=item_names or [],
         is_stream=is_stream,
+        task_id="996",
     )
 
     # 3. 执行调用返回图更新后最新的state
@@ -156,7 +157,11 @@ def run_query_graph(
             print(f"✅✅✅ 当前执行节点{node_name} ✅✅✅")
             final_state = state
 
-    print(f"流程执行完成: {json.dumps(final_state, ensure_ascii=False, indent=4)}")
+    # final_state 中含 MongoDB 的 ObjectId 等 bson 类型，json 默认不支持，
+    # 用 default=str 兜底把它们转成字符串再序列化
+    print(
+        f"流程执行完成: {json.dumps(final_state, ensure_ascii=False, indent=4, default=str)}"
+    )
 
 
 if __name__ == "__main__":
@@ -164,10 +169,24 @@ if __name__ == "__main__":
     setup_logging()
     print("开始执行查询流程")
 
-    # 开始测试
+    # run_query_graph(
+    #     session_id="0001",
+    #     question="如何一键恢复出厂设置呢？",
+    #     item_names=[],
+    #     is_stream=False,644
+    # )
+
     run_query_graph(
         session_id="0001",
-        question="HUAWEI MateStation12电脑如何一键恢复出厂设置呢？",
-        item_names=["HUAWEI MateStation S 12代酷睿版"],
+        question="我说的是HUAWEI MateStation12电脑",
+        item_names=[],
         is_stream=False,
     )
+
+    #
+    # run_query_graph(
+    #     session_id="0001",
+    #     question="HUAWEI MateStation12电脑如何一键恢复出厂设置呢？",
+    #     item_names=["HUAWEI MateStation S 12代酷睿版"],
+    #     is_stream=False
+    # )

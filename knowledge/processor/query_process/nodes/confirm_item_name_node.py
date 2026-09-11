@@ -102,7 +102,13 @@ class ConfirmItemNameNode(BaseNode):
         # 6. 回填历史记录中所有为空的item_names
         if confirmed_item_names:
             ids_to_update = [
-                str(msg["_id"]) for msg in chat_history if not msg.get("item_names")
+                str(msg["_id"])
+                for msg in chat_history
+                if not [
+                    name
+                    for name in (msg.get("item_names") or [])
+                    if name and str(name).strip()
+                ]
             ]
             if ids_to_update:
                 mongo_tool.update_message_item_names(
@@ -335,7 +341,7 @@ class ConfirmItemNameNode(BaseNode):
                 for high_related_item_name in high_related_item_names:
                     item_name = high_related_item_name.get("item_name")
                     if item_name == extracted_name:
-                        accurate_item = item_name
+                        accurate_item = high_related_item_name
                         break
 
                 # 场景1: 找到精确匹配的商品名
