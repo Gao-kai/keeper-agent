@@ -6,7 +6,8 @@ from knowledge.processor.query_process.exception import LLMError
 from knowledge.processor.query_process.state import QueryGraphState
 from knowledge.prompts.query_prompt import ANSWER_PROMPT
 from knowledge.utils.llm_client import get_llm_client
-from knowledge.utils.sse_push import push_sse_event, SSEEvent, set_sse_queue
+from knowledge.utils.mongo_client import get_mongo_tool, MongoDBTool
+from knowledge.utils.sse_push import push_sse_event, SSEEvent
 from knowledge.utils.task_status import set_task_result
 
 
@@ -48,19 +49,26 @@ class AnswerOutputNode(BaseNode):
 
         answer = state.get("answer")
         task_id = state.get("task_id")
+        is_stream = state.get("is_stream")
 
-        # 1. 如果未调用LLM前就有答案 说明是商品名识别节点未识别出商品名/商品名多选一 此时保存答案 等待后面统一返回给前端
+        mongo_tool = get_mongo_tool()
+
+        # 1. 如果未调用LLM前就有答案 说明是商品名识别节点未识别出商品名/商品名多选一
+        #    流式输出 直接在最后push_sse_event的时候将这些输出
+        #    普通输出 先存到task执行结果中 后面一起返回
         if answer:
-            set_task_result(task_id, answer)
+            if not is_stream:
+                set_task_result(task_id, answer)
         else:
-            prompt = self.build_prompt(state, config)
+            prompt = self.build_prompt(state, config, mongo_tool)
             state["prompt"] = prompt
             self.generate_answer(state, prompt)
 
-        # TODO 写入历史记录
+        # 2. 写入历史记录
+        self.write_answer_to_history(state, mongo_tool)
 
-        # 流式模式发送结束事件（会将未识别出商品名的答案一起流式输出给前端）
-        is_stream = state.get("is_stream")
+        # 3. 流式模式发送结束事件（会将未识别出商品名的答案一起流式输出给前端）
+
         if is_stream:
             push_sse_event(
                 task_id=task_id,
@@ -70,7 +78,9 @@ class AnswerOutputNode(BaseNode):
 
         return state
 
-    def build_prompt(self, state: QueryGraphState, config: QueryConfig):
+    def build_prompt(
+        self, state: QueryGraphState, config: QueryConfig, mongo_tool: MongoDBTool
+    ):
         """
         构建提示词模版
 
@@ -87,6 +97,7 @@ class AnswerOutputNode(BaseNode):
         Args:
             state:
             config:
+            mongo_tool:
 
         session_id: 会话 ID，用于追踪多轮对话。
         message_id: 消息 ID，标识单次查询。
@@ -120,7 +131,12 @@ class AnswerOutputNode(BaseNode):
             )
         )
 
-        # TODO 新增历史上下文对话
+        # 生成提示词中包含历史上下文对话
+        chat_history_prompts, available_llm_prompt_length = (
+            self.generate_chat_history_prompts(
+                state, config, available_llm_prompt_length, mongo_tool
+            )
+        )
 
         # 生成提示词中包含实体之间关系 短文档 和前面的检索长文档互补 提供关系链
         graph_relation_texts_prompts, available_llm_prompt_length = (
@@ -233,6 +249,56 @@ class AnswerOutputNode(BaseNode):
 
         return graph_relation_text_prompts, available_llm_prompt_length
 
+    @staticmethod
+    def generate_chat_history_prompts(
+        state: QueryGraphState,
+        config: QueryConfig,
+        available_llm_prompt_length: int,
+        mongo_tool: MongoDBTool,
+    ):
+        """
+
+        Args:
+            state:
+            config:
+            available_llm_prompt_length:
+            mongo_tool:
+
+        Returns:
+
+        """
+        if available_llm_prompt_length <= 0:
+            return None
+
+        session_id = state.get("session_id")
+        chat_history = []
+        if mongo_tool is not None:
+            chat_history = mongo_tool.get_history_message(
+                session_id=session_id, limit=10
+            )
+
+        if not chat_history:
+            return None
+
+        used_char_length = 0
+        prompt_list = []
+        for index, chat_document in enumerate(chat_history):
+            messages: List[str] = [f"[{chat_document.role}]", f"{chat_document.text}"]
+            chat_message_prompt = "  ".join(messages)
+            if (
+                len(chat_message_prompt) + used_char_length
+                >= available_llm_prompt_length
+            ):
+                break
+
+            prompt_list.append(chat_message_prompt)
+            used_char_length += len(chat_message_prompt) + 1
+
+        chat_history_prompts = "\n".join(prompt_list)
+        available_llm_prompt_length -= used_char_length
+
+        return chat_history_prompts, available_llm_prompt_length
+
     def generate_answer(self, state: QueryGraphState, prompt: str):
         """
         生成答案
@@ -291,6 +357,46 @@ class AnswerOutputNode(BaseNode):
             self.logger.error(f"生成答案出错: {e}")
 
         return "抱歉，回答您的问题时出现了一些问题"
+
+    def write_answer_to_history(self, state: QueryGraphState, mongo_tool: MongoDBTool):
+        """
+        将LLM输出的答案写入到历史对话mongo db中
+        方便下一轮调用时大模型参考
+        Args:
+            state:
+            mongo_tool:
+
+        Returns:
+
+        """
+        session_id = state["session_id"]
+        rewritten_query = state.get("rewritten_query", "") or state.get(
+            "original_query", ""
+        )
+        item_names = state.get("item_names") or []
+        if mongo_tool is None:
+            return
+        try:
+            # 先写入用户问题
+            mongo_tool.save_history_message(
+                session_id=session_id,
+                role="user",
+                text=state["original_query"],
+                query=rewritten_query,
+                item_names=item_names,
+            )
+
+            # 后写入LLM答案
+            if state.get("answer"):
+                mongo_tool.save_history_message(
+                    session_id=session_id,
+                    role="assistant",
+                    text=state["answer"],
+                    query=rewritten_query,
+                    item_names=item_names,
+                )
+        except Exception as e:
+            self.logger.warning(f"写入历史记录失败: {e}")
 
 
 if __name__ == "__main__":
