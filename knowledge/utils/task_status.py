@@ -26,11 +26,12 @@ def set_task_result(task_id: str, data):
 
 
 def get_task_result(task_id: str):
-    return task_result.get("task_id", None)
+    return task_result.get(task_id, None)
 
 
 # 节点中英文转换
 _NODE_NAME_TO_CN: Dict[str, str] = {
+    # 导入侧
     "upload_file": "上传文件",
     "entry_node": "检查文件",
     "pdf_to_md_node": "PDF转Markdown",
@@ -41,6 +42,15 @@ _NODE_NAME_TO_CN: Dict[str, str] = {
     "save_to_milvus_node": "导入向量数据库",
     "knowledge_graph_node": "导入知识图谱",
     "__end__": "处理完成",
+    # 查询侧
+    "confirm_item_name_node": "确认问题产品",
+    "hybrid_vector_search_node": "切片搜索",
+    "hyde_document_embedding_search_node": "切片搜索(假设性文档)",
+    "query_knowledge_graph_node": "查询知识图谱",
+    "web_search_mcp_node": "网络搜索",
+    "rrf_rank_node": "倒排融合",
+    "re_rank_node": "重排序",
+    "answer_output_node": "生成答案",
 }
 
 

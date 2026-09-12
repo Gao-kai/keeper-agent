@@ -278,7 +278,7 @@ class AnswerOutputNode(BaseNode):
             )
 
         if not chat_history:
-            return None
+            return "", available_llm_prompt_length
 
         used_char_length = 0
         prompt_list = []

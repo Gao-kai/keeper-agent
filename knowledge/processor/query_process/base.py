@@ -11,7 +11,14 @@ import logging
 
 from knowledge.processor.query_process.config import QueryConfig, get_query_config
 from knowledge.processor.query_process.exception import QueryProcessError
-from knowledge.utils.task_status import add_running_task, add_completed_task
+from knowledge.utils.sse_push import push_sse_event
+from knowledge.utils.task_status import (
+    add_running_task,
+    add_completed_task,
+    get_task_status,
+    get_completed_task_list,
+    get_running_task_list,
+)
 
 T = TypeVar("T")  # 泛型状态类型
 
@@ -69,25 +76,39 @@ class BaseNode(ABC):
         self.logger.info(f"--- {self.name} 开始 ---")
 
         # 注册任务追踪
-        session_id = state.get("session_id", "") if isinstance(state, dict) else ""
-        is_stream = state.get("is_stream", False) if isinstance(state, dict) else False
-
-        if session_id:
-            try:
-                add_running_task(session_id, self.name)
-            except Exception as e:
-                self.logger.warning(f"任务追踪注册失败: {e}")
+        is_stream = state.get("is_stream", False)
+        task_id = state.get("task_id", "")
 
         try:
+            self.logger.info(f"--- {self.name} 开始 ---")
+            if task_id:
+                add_running_task(task_id, self.name)
+                if is_stream:
+                    push_sse_event(
+                        task_id,
+                        "progress",
+                        {
+                            "status": get_task_status(task_id),
+                            "done_list": get_completed_task_list(task_id),
+                            "running_list": get_running_task_list(task_id),
+                        },
+                    )
             result = self.process(state)
             self.logger.info(f"--- {self.name} 完成 ---")
 
             # 标记任务完成
-            if session_id:
-                try:
-                    add_completed_task(session_id, self.name)
-                except Exception as e:
-                    self.logger.warning(f"任务完成标记失败: {e}")
+            if task_id:
+                add_completed_task(task_id, self.name)
+                if is_stream:
+                    push_sse_event(
+                        task_id,
+                        "progress",
+                        {
+                            "status": get_task_status(task_id),
+                            "done_list": get_completed_task_list(task_id),
+                            "running_list": get_running_task_list(task_id),
+                        },
+                    )
 
             return result
         except QueryProcessError:

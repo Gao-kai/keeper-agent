@@ -44,7 +44,7 @@ class MongoDBTool:
             return result.deleted_count
         except Exception as e:
             logger.info(f"删除 {session_id} 所属消息失败 ❌：{e}")
-            return None
+            return 0
 
     def get_history_message(self, session_id: str, limit: int = 10):
         """

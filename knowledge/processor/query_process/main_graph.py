@@ -122,7 +122,11 @@ def create_query_graph():
 
 
 def run_query_graph(
-    question: str, session_id: str, item_names: list = None, is_stream: bool = False
+    question: str,
+    session_id: str,
+    task_id: str,
+    item_names: list = None,
+    is_stream: bool = False,
 ):
     """
 
@@ -131,6 +135,7 @@ def run_query_graph(
         session_id:
         item_names:
         is_stream:
+        task_id:
 
     Returns:
 
@@ -147,7 +152,7 @@ def run_query_graph(
         original_query=question,
         item_names=item_names or [],
         is_stream=is_stream,
-        task_id="996",
+        task_id=task_id,
     )
 
     # 3. 执行调用返回图更新后最新的state
